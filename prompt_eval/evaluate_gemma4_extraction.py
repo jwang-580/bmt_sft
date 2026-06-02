@@ -5,7 +5,7 @@ Evaluate Gemma 4 prompt variants for CIBMTR Form 2400 extraction.
 Examples:
     python prompt_eval/evaluate_gemma4_extraction.py --dataset mimic --limit 5 --fields_per_call 1,5,25
     python prompt_eval/evaluate_gemma4_extraction.py --dataset osu --modes baseline,no_reasoning,non_json --limit 3
-    python prompt_eval/evaluate_gemma4_extraction.py --models unsloth/Gemma-4-E2B-it,unsloth/Gemma-4-E4B-it
+    python prompt_eval/evaluate_gemma4_extraction.py --models google/gemma-4-E2B-it,google/gemma-4-E4B-it
 """
 
 import argparse
@@ -27,10 +27,10 @@ if load_dotenv:
 
 
 DEFAULT_GEMMA4_MODELS = {
-    "e2b": "unsloth/Gemma-4-E2B-it",
-    "e4b": "unsloth/Gemma-4-E4B-it",
-    "26b-a4b": "unsloth/Gemma-4-26B-A4B-it",
-    "31b": "unsloth/Gemma-4-31B-it",
+    "e2b": "google/gemma-4-E2B-it",
+    "e4b": "google/gemma-4-E4B-it",
+    "26b-a4b": "google/gemma-4-26B-A4B-it",
+    "31b": "google/gemma-4-31B-it",
 }
 
 DEFAULT_MODES = [
@@ -453,59 +453,97 @@ def coerce_records(raw_records, note, field_ids, question_metadata, mode):
     return coerced
 
 
-def import_unsloth_runtime():
+def import_transformers_runtime():
     try:
         import torch
-        from unsloth import FastModel
+        from transformers import AutoModelForCausalLM, AutoProcessor
     except ImportError as exc:
         raise RuntimeError(
-            "Missing runtime dependency. Install Unsloth and PyTorch before running inference."
+            "Missing runtime dependency. Install Transformers, Accelerate, and PyTorch before running inference."
         ) from exc
-    return torch, FastModel
+    return torch, AutoModelForCausalLM, AutoProcessor
 
 
 def load_model(model_name, max_seq_length, load_in_4bit):
-    torch, FastModel = import_unsloth_runtime()
-    model, tokenizer = FastModel.from_pretrained(
-        model_name=model_name,
-        max_seq_length=max_seq_length,
-        load_in_4bit=load_in_4bit,
-        full_finetuning=False,
-    )
-    model.eval()
-    return torch, model, tokenizer
+    torch, AutoModelForCausalLM, AutoProcessor = import_transformers_runtime()
+    processor = AutoProcessor.from_pretrained(model_name)
 
-
-def generate(model, tokenizer, torch, messages, max_new_tokens, temperature, top_p, top_k, enable_thinking):
-    chat_kwargs = {
-        "tokenize": True,
-        "add_generation_prompt": True,
-        "return_tensors": "pt",
+    model_kwargs = {
+        "device_map": "auto",
+        "dtype": "auto",
     }
+    if load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise RuntimeError("4-bit loading requires bitsandbytes support in Transformers.") from exc
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    model.eval()
+    return torch, model, processor
+
+
+def processor_text(response):
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        for key in ("answer", "content", "text", "response"):
+            if key in response:
+                return processor_text(response[key])
+        return json.dumps(response, ensure_ascii=False)
+    if isinstance(response, (list, tuple)):
+        return "\n".join(processor_text(item) for item in response if processor_text(item))
+    return str(response)
+
+
+def generate(model, processor, torch, messages, max_new_tokens, temperature, top_p, top_k, enable_thinking):
     try:
-        input_ids = tokenizer.apply_chat_template(
+        text = processor.apply_chat_template(
             messages,
+            tokenize=False,
+            add_generation_prompt=True,
             enable_thinking=enable_thinking,
-            **chat_kwargs,
         )
     except TypeError:
-        input_ids = tokenizer.apply_chat_template(messages, **chat_kwargs)
+        text = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
+    inputs = processor(text=text, return_tensors="pt")
     if hasattr(model, "device"):
-        input_ids = input_ids.to(model.device)
+        inputs = inputs.to(model.device)
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+    generate_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": temperature > 0,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+    }
+    if eos_token_id is not None:
+        generate_kwargs["pad_token_id"] = eos_token_id
 
     with torch.inference_mode():
         output_ids = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            pad_token_id=tokenizer.eos_token_id,
+            **inputs,
+            **generate_kwargs,
         )
-    generated_ids = output_ids[0][input_ids.shape[-1] :]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    input_len = inputs["input_ids"].shape[-1]
+    response = processor.decode(output_ids[0][input_len:], skip_special_tokens=False)
+    if hasattr(processor, "parse_response"):
+        try:
+            return processor_text(processor.parse_response(response)).strip()
+        except Exception:
+            pass
+    return processor.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
 
 
 def evaluate_predictions(predictions, gold):
@@ -566,7 +604,7 @@ def existing_completed(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Gemma 4 extraction prompt variants with Unsloth.")
+    parser = argparse.ArgumentParser(description="Evaluate Gemma 4 extraction prompt variants with Transformers.")
     parser.add_argument("--dataset", choices=["mimic", "osu"], default="mimic")
     parser.add_argument("--mimic_path", default="data/mimic_iv_bmt_initial_progression.csv")
     parser.add_argument("--osu_path", default="data/osu_h_p_notes.csv")
@@ -640,14 +678,14 @@ def main():
 
     for model_name in models:
         try:
-            torch, model, tokenizer = load_model(
+            torch, model, processor = load_model(
                 model_name,
                 max_seq_length=args.max_seq_length,
                 load_in_4bit=args.load_in_4bit,
             )
         except RuntimeError as exc:
             print(f"Error: {exc}")
-            print("Install guidance: https://unsloth.ai/docs/models/gemma-4")
+            print("Install guidance: pip install -U transformers torch accelerate")
             return
 
         for mode in modes:
@@ -691,7 +729,7 @@ def main():
                         call_count += 1
                         generated = generate(
                             model,
-                            tokenizer,
+                            processor,
                             torch,
                             messages,
                             max_new_tokens=args.max_new_tokens,
@@ -773,7 +811,7 @@ def main():
                 print(json.dumps(metrics, indent=2))
 
         del model
-        del tokenizer
+        del processor
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
