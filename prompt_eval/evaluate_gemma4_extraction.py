@@ -6,6 +6,7 @@ Examples:
     python prompt_eval/evaluate_gemma4_extraction.py --dataset mimic --limit 5 --fields_per_call 1,5,25
     python prompt_eval/evaluate_gemma4_extraction.py --dataset osu --modes baseline,no_reasoning,non_json --limit 3
     python prompt_eval/evaluate_gemma4_extraction.py --models google/gemma-4-E2B-it,google/gemma-4-E4B-it
+    python prompt_eval/evaluate_gemma4_extraction.py --save_raw_runs  # opt-in raw JSONL debugging
 """
 
 import argparse
@@ -104,8 +105,14 @@ def variant_paths(output_dir, dataset, model_name, mode, fields_per_call):
     stem = variant_stem(dataset, model_name, mode, fields_per_call)
     return {
         "runs": output_dir / f"{stem}_runs.jsonl",
+    }
+
+
+def concentrated_paths(output_dir, dataset):
+    stem = slugify(dataset)
+    return {
         "predictions": output_dir / f"{stem}_predictions.json",
-        "summary": output_dir / f"{stem}_summary.csv",
+        "summary": output_dir / f"{stem}_aggregate_summary.csv",
     }
 
 
@@ -603,6 +610,47 @@ def existing_completed(path):
     return done
 
 
+def existing_completed_predictions(predictions):
+    done = set()
+    for pred in predictions:
+        try:
+            done.add(
+                (
+                    pred["dataset"],
+                    pred["mode"],
+                    pred["model"],
+                    int(pred["fields_per_call"]),
+                    str(pred.get("record_id")),
+                    str(pred.get("field_id")),
+                )
+            )
+        except KeyError:
+            continue
+    return done
+
+
+def prediction_matches_variant(prediction, dataset, mode, model_name, fields_per_call):
+    return (
+        prediction.get("dataset") == dataset
+        and prediction.get("mode") == mode
+        and prediction.get("model") == model_name
+        and int(prediction.get("fields_per_call", -1)) == fields_per_call
+    )
+
+
+def add_variant_metadata(predictions, dataset, mode, model_name, fields_per_call):
+    for prediction in predictions:
+        prediction.update(
+            {
+                "dataset": dataset,
+                "mode": mode,
+                "model": model_name,
+                "fields_per_call": fields_per_call,
+            }
+        )
+    return predictions
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Gemma 4 extraction prompt variants with Transformers.")
     parser.add_argument("--dataset", choices=["mimic", "osu"], default="mimic")
@@ -632,13 +680,18 @@ def main():
     parser.add_argument("--top_k", type=int, default=64)
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--save_raw_runs",
+        action="store_true",
+        help="Also save per-variant JSONL records with raw generations for debugging.",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Build configs/prompts without loading Gemma 4.")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset = args.dataset
-    summary_path = output_dir / f"{slugify(dataset)}_aggregate_summary.csv"
+    paths = concentrated_paths(output_dir, dataset)
 
     question_metadata = load_question_metadata(args.questions)
     field_ids = list(question_metadata)
@@ -675,6 +728,7 @@ def main():
         return
 
     summary_rows = []
+    all_predictions = load_json_list(paths["predictions"]) if args.resume else []
 
     for model_name in models:
         try:
@@ -691,13 +745,21 @@ def main():
         for mode in modes:
             settings = mode_settings(mode)
             for fields_per_call in fields_per_call_values:
-                paths = variant_paths(output_dir, dataset, model_name, mode, fields_per_call)
-                if not args.resume:
-                    for path in paths.values():
-                        if path.exists():
-                            path.unlink()
-                completed = existing_completed(paths["runs"]) if args.resume else set()
-                variant_predictions = load_json_list(paths["predictions"]) if args.resume else []
+                variant_run_paths = variant_paths(output_dir, dataset, model_name, mode, fields_per_call)
+                if args.save_raw_runs and not args.resume and variant_run_paths["runs"].exists():
+                    variant_run_paths["runs"].unlink()
+                if args.resume:
+                    completed = existing_completed_predictions(all_predictions)
+                    if args.save_raw_runs:
+                        completed.update(existing_completed(variant_run_paths["runs"]))
+                    variant_predictions = [
+                        prediction
+                        for prediction in all_predictions
+                        if prediction_matches_variant(prediction, dataset, mode, model_name, fields_per_call)
+                    ]
+                else:
+                    completed = set()
+                    variant_predictions = []
                 parse_errors = 0
                 call_count = 0
                 started = time.time()
@@ -763,21 +825,30 @@ def main():
                             for prediction in predictions:
                                 prediction["parse_error"] = str(exc)
 
-                        variant_predictions.extend(predictions)
-                        append_jsonl(
-                            paths["runs"],
-                            {
-                                "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                                "dataset": dataset,
-                                "mode": mode,
-                                "model": model_name,
-                                "fields_per_call": fields_per_call,
-                                "record_id": note["record_id"],
-                                "field_ids": field_batch,
-                                "raw_generation": generated,
-                                "predictions": predictions,
-                            },
+                        predictions = add_variant_metadata(
+                            predictions,
+                            dataset,
+                            mode,
+                            model_name,
+                            fields_per_call,
                         )
+                        variant_predictions.extend(predictions)
+                        all_predictions.extend(predictions)
+                        if args.save_raw_runs:
+                            append_jsonl(
+                                variant_run_paths["runs"],
+                                {
+                                    "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                    "dataset": dataset,
+                                    "mode": mode,
+                                    "model": model_name,
+                                    "fields_per_call": fields_per_call,
+                                    "record_id": note["record_id"],
+                                    "field_ids": field_batch,
+                                    "raw_generation": generated,
+                                    "predictions": predictions,
+                                },
+                            )
                         for prediction in predictions:
                             completed.add(
                                 (
@@ -806,8 +877,7 @@ def main():
                     }
                 )
                 summary_rows.append(metrics)
-                write_json(paths["predictions"], variant_predictions)
-                write_csv_records(paths["summary"], [metrics], summary_fields())
+                write_json(paths["predictions"], all_predictions)
                 print(json.dumps(metrics, indent=2))
 
         del model
@@ -816,9 +886,11 @@ def main():
             torch.cuda.empty_cache()
 
     summary_fields_list = summary_fields()
-    write_csv_records(summary_path, summary_rows, summary_fields_list)
-    print(f"\nSaved per-variant raw runs, predictions, and summaries under {output_dir}")
-    print(f"Saved aggregate summary to {summary_path}")
+    write_csv_records(paths["summary"], summary_rows, summary_fields_list)
+    print(f"\nSaved concentrated predictions to {paths['predictions']}")
+    print(f"Saved aggregate summary to {paths['summary']}")
+    if args.save_raw_runs:
+        print(f"Saved per-variant raw runs under {output_dir}")
 
 
 def summary_fields():
