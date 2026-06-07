@@ -523,7 +523,7 @@ def mode_settings(mode):
         raise ValueError(f"Unknown mode {mode}. Valid modes: {', '.join(DEFAULT_MODES)}")
     return {
         "json": mode != "non_json",
-        "thinking": mode in {"baseline", "few_shot", "no_reasoning_trace_field", "no_evidence_field"},
+        "thinking": mode in {"baseline", "non_json", "few_shot", "no_reasoning_trace_field", "no_evidence_field"},
         "few_shot": mode == "few_shot",
         "extra_fields": JSON_MODE_FIELDS.get(mode, []),
     }
@@ -846,7 +846,39 @@ def load_model(model_name, max_seq_length, load_in_4bit):
 
     model = AutoModelForMultimodalLM.from_pretrained(model_name, **model_kwargs)
     model.eval()
+    print_model_placement(model, torch)
     return torch, model, processor
+
+
+def print_model_placement(model, torch):
+    device_map = getattr(model, "hf_device_map", None)
+    if device_map:
+        counts = defaultdict(int)
+        for device in device_map.values():
+            counts[str(device)] += 1
+        print(f"Model device map: {dict(sorted(counts.items()))}")
+        offloaded = {
+            name: device
+            for name, device in device_map.items()
+            if str(device).lower() in {"cpu", "disk"} or str(device).startswith("cpu")
+        }
+        if offloaded:
+            sample = dict(list(offloaded.items())[:8])
+            print(f"Warning: model has CPU/disk offloaded modules; sample: {sample}")
+        else:
+            print("Model device map contains no CPU/disk offloaded modules.")
+    else:
+        device = getattr(model, "device", None)
+        print(f"Model device: {device}")
+
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            allocated_gb = torch.cuda.memory_allocated(index) / (1024 ** 3)
+            reserved_gb = torch.cuda.memory_reserved(index) / (1024 ** 3)
+            print(
+                f"CUDA {index}: {torch.cuda.get_device_name(index)} "
+                f"allocated={allocated_gb:.2f}GB reserved={reserved_gb:.2f}GB"
+            )
 
 
 def processor_text(response):
