@@ -21,8 +21,8 @@ completion timestamp; an unstamped checkpoint file is also maintained for
 --resume.
 
 Model placement defaults to --device auto, which lets Transformers shard across
-available devices. Use --device cuda:0 or --device cuda:1 to force a model onto
-a single GPU when it fits.
+available devices. Use --device cuda:0, --device cuda:1, or the shorthand
+--device 0 to force a model onto a single GPU when it fits.
 
 Qwen thinking defaults to --qwen_thinking auto, which enables Qwen's internal
 thinking mode for prompt modes that ask for rationale fields. Use
@@ -867,6 +867,15 @@ def import_transformers_runtime():
     return torch, AutoModelForImageTextToText, AutoProcessor
 
 
+def normalize_device_arg(device):
+    normalized = str(device).strip()
+    if not normalized or normalized.lower() == "auto":
+        return "auto"
+    if normalized.isdigit():
+        return f"cuda:{normalized}"
+    return normalized
+
+
 def load_model(model_name, load_in_4bit, device):
     torch, AutoModelForImageTextToText, AutoProcessor = import_transformers_runtime()
     processor = AutoProcessor.from_pretrained(model_name)
@@ -1320,7 +1329,7 @@ def main():
     parser.add_argument(
         "--device",
         default="auto",
-        help='Device for model placement. Use "auto" for Transformers sharding, or e.g. cuda:0, cuda:1, cpu.',
+        help='Device for model placement. Use "auto" for Transformers sharding, or e.g. cuda:0, cuda:1, 0, 1, cpu.',
     )
     parser.add_argument(
         "--qwen_thinking",
@@ -1363,6 +1372,7 @@ def main():
     )
     parser.add_argument("--dry_run", action="store_true", help="Build configs/prompts without loading Qwen3.5.")
     args = parser.parse_args()
+    args.device = normalize_device_arg(args.device)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
