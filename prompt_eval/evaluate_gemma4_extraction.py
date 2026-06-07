@@ -177,7 +177,7 @@ def build_field_name_lookup(field_ids, question_metadata):
     return {name: ids[0] for name, ids in by_name.items() if len(ids) == 1}
 
 
-def resolve_record_field_id(record, field_ids, question_metadata, field_name_lookup):
+def resolve_record_field_id(record, field_ids, field_name_lookup):
     allowed_field_ids = set(field_ids)
 
     for key in ("field_id", "question_id", "question_number", "question"):
@@ -355,18 +355,6 @@ def parse_mode_int_map(value):
     return mode_values
 
 
-def build_fields_per_call_plan(modes, baseline_values, comparison_value, mode_overrides):
-    plan = {}
-    for mode in modes:
-        if mode in mode_overrides:
-            plan[mode] = [mode_overrides[mode]]
-        elif mode in {"baseline", "non_json"}:
-            plan[mode] = baseline_values
-        else:
-            plan[mode] = [comparison_value]
-    return plan
-
-
 def build_variant_fields_per_call_plan(modes, note_strategy_plan, baseline_values, comparison_value, mode_overrides):
     plan = {}
     for mode in modes:
@@ -529,7 +517,7 @@ def mode_settings(mode):
     }
 
 
-def build_system_prompt(mode):
+def build_system_prompt():
     return (
         "You are a careful clinical information extraction system for BMT notes. "
         + "Extract only information supported by the supplied note. "
@@ -790,7 +778,7 @@ def coerce_records(raw_records, note, field_ids, question_metadata, mode):
     field_name_lookup = build_field_name_lookup(field_ids, question_metadata)
     for index, record in enumerate(raw_records):
         if isinstance(record, dict):
-            field_id = resolve_record_field_id(record, field_ids, question_metadata, field_name_lookup)
+            field_id = resolve_record_field_id(record, field_ids, field_name_lookup)
             if not field_id and index < len(field_ids):
                 field_id = field_ids[index]
             if field_id:
@@ -829,7 +817,7 @@ def import_transformers_runtime():
     return torch, AutoModelForMultimodalLM, AutoProcessor
 
 
-def load_model(model_name, max_seq_length, load_in_4bit):
+def load_model(model_name, load_in_4bit):
     torch, AutoModelForMultimodalLM, AutoProcessor = import_transformers_runtime()
     processor = AutoProcessor.from_pretrained(model_name)
 
@@ -956,50 +944,79 @@ def generate_predictions(
     temperature,
     top_p,
     top_k,
+    parse_retries,
 ):
     settings = mode_settings(mode)
     messages = [
-        {"role": "system", "content": build_system_prompt(mode)},
+        {"role": "system", "content": build_system_prompt()},
         {"role": "user", "content": prompt},
     ]
-    generated, thought = generate(
-        model,
-        processor,
-        torch,
-        messages,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        enable_thinking=settings["thinking"],
-    )
-
+    attempts = []
+    max_attempts = max(parse_retries, 0) + 1
+    generated = ""
+    thought = ""
     parse_error = ""
-    try:
-        if settings["json"]:
-            raw_records = parse_json_generation(generated)
-        else:
-            raw_records = parse_non_json_generation(generated, field_batch)
-        predictions = coerce_records(
-            raw_records,
-            note,
-            field_batch,
-            question_metadata,
-            mode,
-        )
-    except Exception as exc:
-        parse_error = str(exc)
-        predictions = coerce_records(
-            [{"field_id": field_id, "answers": "N/A"} for field_id in field_batch],
-            note,
-            field_batch,
-            question_metadata,
-            mode,
-        )
-        for prediction in predictions:
-            prediction["parse_error"] = parse_error
 
-    return generated, thought, predictions, parse_error
+    for attempt in range(1, max_attempts + 1):
+        generated, thought = generate(
+            model,
+            processor,
+            torch,
+            messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            enable_thinking=settings["thinking"],
+        )
+
+        try:
+            if settings["json"]:
+                raw_records = parse_json_generation(generated)
+            else:
+                raw_records = parse_non_json_generation(generated, field_batch)
+            predictions = coerce_records(
+                raw_records,
+                note,
+                field_batch,
+                question_metadata,
+                mode,
+            )
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "thought": thought,
+                    "raw_generation": generated,
+                    "parse_error": "",
+                }
+            )
+            return generated, thought, predictions, "", attempts
+        except Exception as exc:
+            parse_error = str(exc)
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "thought": thought,
+                    "raw_generation": generated,
+                    "parse_error": parse_error,
+                }
+            )
+
+    predictions = coerce_records(
+        [{"field_id": field_id, "answers": "N/A"} for field_id in field_batch],
+        note,
+        field_batch,
+        question_metadata,
+        mode,
+    )
+    for prediction in predictions:
+        prediction["parse_error"] = parse_error
+
+    return generated, thought, predictions, parse_error, attempts
+
+
+def failed_generation_attempts(attempts):
+    return [attempt for attempt in attempts if attempt.get("parse_error")]
 
 
 def evaluate_predictions(predictions, gold):
@@ -1150,10 +1167,14 @@ def main():
         ),
     )
     parser.add_argument("--all_fields", action="store_true", help="Evaluate every form field unless --field_limit is set.")
-    parser.add_argument("--max_seq_length", type=int, default=32768)
     parser.add_argument("--max_new_tokens", type=int, default=8192)
+    parser.add_argument(
+        "--parse_retries",
+        type=int,
+        default=1,
+        help="Number of extra generations to try when parsing fails.",
+    )
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
-    parser.add_argument("--no_load_in_4bit", action="store_false", dest="load_in_4bit")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=64)
@@ -1185,18 +1206,14 @@ def main():
     baseline_fields_per_call_values = parse_int_csv_list(args.fields_per_call)
     if args.comparison_fields_per_call is not None and args.comparison_fields_per_call <= 0:
         raise ValueError("--comparison_fields_per_call must be positive.")
+    if args.parse_retries < 0:
+        raise ValueError("--parse_retries must be non-negative.")
     comparison_fields_per_call = args.comparison_fields_per_call or max(baseline_fields_per_call_values)
     models = resolve_models(args.models)
     checkpoint_paths = concentrated_paths(output_dir, dataset, models)
     modes = parse_csv_list(args.modes)
     mode_fields_per_call = parse_mode_int_map(args.mode_fields_per_call)
     note_strategy_plan = build_note_strategy_plan(modes, args.note_strategy)
-    fields_per_call_plan = build_fields_per_call_plan(
-        modes,
-        baseline_fields_per_call_values,
-        comparison_fields_per_call,
-        mode_fields_per_call,
-    )
     variant_fields_per_call_plan = build_variant_fields_per_call_plan(
         modes,
         note_strategy_plan,
@@ -1242,7 +1259,6 @@ def main():
     print(f"Models: {models}")
     print(f"Modes: {modes}")
     print(f"Note strategy plan: {note_strategy_plan}")
-    print(f"Fields per call plan: {fields_per_call_plan}")
     print(f"Variant fields per call plan: {variant_fields_per_call_plan}")
     if any("chunked" in strategies for strategies in note_strategy_plan.values()):
         print(f"Chunk chars: {args.chunk_chars}")
@@ -1263,7 +1279,6 @@ def main():
         try:
             torch, model, processor = load_model(
                 model_name,
-                max_seq_length=args.max_seq_length,
                 load_in_4bit=args.load_in_4bit,
             )
         except RuntimeError as exc:
@@ -1272,7 +1287,6 @@ def main():
             return
 
         for mode in modes:
-            settings = mode_settings(mode)
             for note_strategy in note_strategy_plan[mode]:
                 for fields_per_call in variant_fields_per_call_plan[(mode, note_strategy)]:
                     variant_run_paths = variant_paths(
@@ -1360,7 +1374,7 @@ def main():
                                     chunks = note_chunks[note["record_id"]]
                                     for chunk_index, chunk in enumerate(chunks):
                                         chunked_record = chunk_note(note, chunk, chunk_index, len(chunks))
-                                        generated, thought, predictions, parse_error = generate_predictions(
+                                        generated, thought, predictions, parse_error, attempts = generate_predictions(
                                             model,
                                             processor,
                                             torch,
@@ -1373,8 +1387,9 @@ def main():
                                             temperature=args.temperature,
                                             top_p=args.top_p,
                                             top_k=args.top_k,
+                                            parse_retries=args.parse_retries,
                                         )
-                                        call_count += 1
+                                        call_count += len(attempts)
                                         if parse_error:
                                             parse_errors += 1
                                         for prediction in predictions:
@@ -1387,6 +1402,7 @@ def main():
                                                 "thought": thought,
                                                 "raw_generation": generated,
                                                 "parse_error": parse_error,
+                                                "generation_attempts": failed_generation_attempts(attempts),
                                             }
                                         )
                                         progress.update(1)
@@ -1398,7 +1414,7 @@ def main():
                                         mode,
                                         chunk_predictions,
                                     )
-                                    generated, thought, predictions, parse_error = generate_predictions(
+                                    generated, thought, predictions, parse_error, attempts = generate_predictions(
                                         model,
                                         processor,
                                         torch,
@@ -1411,8 +1427,9 @@ def main():
                                         temperature=args.temperature,
                                         top_p=args.top_p,
                                         top_k=args.top_k,
+                                        parse_retries=args.parse_retries,
                                     )
-                                    call_count += 1
+                                    call_count += len(attempts)
                                     if parse_error:
                                         parse_errors += 1
                                     for prediction in predictions:
@@ -1422,6 +1439,7 @@ def main():
                                         "chunk_generations": chunk_generations,
                                         "synthesis_generation": generated,
                                         "synthesis_parse_error": parse_error,
+                                        "synthesis_generation_attempts": failed_generation_attempts(attempts),
                                     }
                                     raw_run_thought = {
                                         "chunk_thoughts": [
@@ -1433,9 +1451,20 @@ def main():
                                         ],
                                         "synthesis_thought": thought,
                                     }
+                                    raw_run_attempts = {
+                                        "chunk_attempts": [
+                                            {
+                                                "chunk_index": generation["chunk_index"],
+                                                "generation_attempts": generation["generation_attempts"],
+                                            }
+                                            for generation in chunk_generations
+                                            if generation["generation_attempts"]
+                                        ],
+                                        "synthesis_generation_attempts": failed_generation_attempts(attempts),
+                                    }
                                     progress.update(1)
                                 else:
-                                    generated, thought, predictions, parse_error = generate_predictions(
+                                    generated, thought, predictions, parse_error, attempts = generate_predictions(
                                         model,
                                         processor,
                                         torch,
@@ -1448,12 +1477,14 @@ def main():
                                         temperature=args.temperature,
                                         top_p=args.top_p,
                                         top_k=args.top_k,
+                                        parse_retries=args.parse_retries,
                                     )
-                                    call_count += 1
+                                    call_count += len(attempts)
                                     if parse_error:
                                         parse_errors += 1
                                     raw_run_generation = generated
                                     raw_run_thought = thought
+                                    raw_run_attempts = failed_generation_attempts(attempts)
                                     progress.update(1)
 
                                 predictions = add_variant_metadata(
@@ -1480,6 +1511,7 @@ def main():
                                             "field_ids": field_batch,
                                             "thought": raw_run_thought,
                                             "raw_generation": raw_run_generation,
+                                            "generation_attempts": raw_run_attempts,
                                             "predictions": predictions,
                                         },
                                     )
