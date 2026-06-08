@@ -4,3 +4,5 @@ data/*
 __pycache__/
 prompt_eval/results/
 *.sh
+*.err
+*.out

@@ -881,7 +881,7 @@ def load_model(model_name, load_in_4bit, device):
     processor = AutoProcessor.from_pretrained(model_name)
 
     model_kwargs = {
-        "dtype": "auto",
+        "dtype": torch.bfloat16,
     }
     if device == "auto":
         model_kwargs["device_map"] = "auto"
@@ -902,16 +902,24 @@ def load_model(model_name, load_in_4bit, device):
     print_model_placement(model, torch)
     return torch, model, processor
 
-
 def resolve_input_device(model, torch, device):
     if device != "auto":
         return torch.device(device)
+
     hf_device_map = getattr(model, "hf_device_map", None)
     if hf_device_map:
         for mapped_device in hf_device_map.values():
-            mapped_device = str(mapped_device)
-            if mapped_device not in {"cpu", "disk"} and not mapped_device.startswith("cpu"):
-                return torch.device(mapped_device)
+            # Accelerate may store GPU ids as integers: 0, 1, etc.
+            if isinstance(mapped_device, int):
+                return torch.device(f"cuda:{mapped_device}")
+
+            mapped_device_str = str(mapped_device)
+            if mapped_device_str.isdigit():
+                return torch.device(f"cuda:{mapped_device_str}")
+
+            if mapped_device_str not in {"cpu", "disk"} and not mapped_device_str.startswith("cpu"):
+                return torch.device(mapped_device_str)
+
     return getattr(model, "device", torch.device("cpu"))
 
 
