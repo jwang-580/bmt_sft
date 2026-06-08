@@ -969,22 +969,47 @@ def processor_text(response):
     return str(response)
 
 
-def extract_thought(response):
+def split_qwen_thought(response):
     think_match = re.search(r"<think>\s*(.*?)\s*</think>", response, flags=re.DOTALL)
     if think_match:
-        return think_match.group(1).strip()
+        thought = think_match.group(1).strip()
+        answer = (response[: think_match.start()] + response[think_match.end() :]).strip()
+        return answer, thought
+
+    if "</think>" in response:
+        thought, answer = response.split("</think>", 1)
+        return answer.strip(), thought.strip()
+
     match = re.search(r"<\|channel>thought\s*", response)
-    if not match:
-        return ""
-    thought = response[match.end() :]
-    end_match = re.search(r"<channel\|>|<\|end\|>", thought)
-    if end_match:
-        thought = thought[: end_match.start()]
-    return thought.strip()
+    if match:
+        thought = response[match.end() :]
+        end_match = re.search(r"<channel\|>|<\|end\|>", thought)
+        if end_match:
+            thought = thought[: end_match.start()]
+            answer = response[end_match.end() :].strip()
+        else:
+            answer = response[: match.start()].strip()
+        return answer, thought.strip()
+
+    return response.strip(), ""
+
+
+def extract_thought(response):
+    return split_qwen_thought(response)[1]
 
 
 def strip_thought(response):
-    return re.sub(r"\s*<think>.*?</think>\s*", "", response, flags=re.DOTALL).strip()
+    return split_qwen_thought(response)[0]
+
+
+def clean_answer_special_tokens(processor, answer):
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+        return processor.decode(
+            tokenizer(answer, add_special_tokens=False)["input_ids"],
+            skip_special_tokens=True,
+        ).strip()
+    return re.sub(r"<\|[^>]+?\|>", "", answer).strip()
 
 
 def supported_generation_kwargs(model, kwargs):
@@ -1079,8 +1104,8 @@ def generate(
         )
     input_len = inputs["input_ids"].shape[-1]
     response = processor.decode(output_ids[0][input_len:], skip_special_tokens=False)
-    thought = extract_thought(response)
-    return strip_thought(processor.decode(output_ids[0][input_len:], skip_special_tokens=True)), thought
+    answer, thought = split_qwen_thought(response)
+    return clean_answer_special_tokens(processor, answer), thought
 
 
 def generate_predictions(
