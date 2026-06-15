@@ -158,6 +158,29 @@ def load_json_list(path):
     return data
 
 
+def load_resume_predictions(checkpoint_path, output_dir, dataset, models):
+    predictions = load_json_list(checkpoint_path)
+    if predictions:
+        return predictions
+
+    latest_path = latest_concentrated_predictions_path(output_dir, dataset, models)
+    if latest_path is None or latest_path == checkpoint_path:
+        return predictions
+    print(f"Resume checkpoint not found or empty; loading latest predictions from {latest_path}")
+    return load_json_list(latest_path)
+
+
+def latest_concentrated_predictions_path(output_dir, dataset, models):
+    prefix = f"{slugify(dataset)}_{model_slug(models)}_"
+    suffix = "_predictions.json"
+    candidates = [
+        path
+        for path in output_dir.glob(f"{prefix}*{suffix}")
+        if path.name != f"{prefix.rstrip('_')}{suffix}"
+    ]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
 def append_jsonl(path, record):
     with open(path, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1240,6 +1263,22 @@ def evaluate_predictions(predictions, gold):
     }
 
 
+def completed_prediction_key(record, pred=None):
+    source = record if pred is None else pred
+    try:
+        return (
+            record["dataset"],
+            record["mode"],
+            record["model"],
+            int(record["fields_per_call"]),
+            record.get("note_strategy", "full"),
+            str(source["record_id"]),
+            str(source["field_id"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def existing_completed(path):
     done = set()
     if not path.exists():
@@ -1250,37 +1289,18 @@ def existing_completed(path):
                 continue
             record = json.loads(line)
             for pred in record.get("predictions", []):
-                done.add(
-                    (
-                        record["dataset"],
-                        record["mode"],
-                        record["model"],
-                        int(record["fields_per_call"]),
-                        record.get("note_strategy", "full"),
-                        str(pred.get("record_id")),
-                        str(pred.get("field_id")),
-                    )
-                )
+                key = completed_prediction_key(record, pred)
+                if key is not None:
+                    done.add(key)
     return done
 
 
 def existing_completed_predictions(predictions):
     done = set()
     for pred in predictions:
-        try:
-            done.add(
-                (
-                    pred["dataset"],
-                    pred["mode"],
-                    pred["model"],
-                    int(pred["fields_per_call"]),
-                    pred.get("note_strategy", "full"),
-                    str(pred.get("record_id")),
-                    str(pred.get("field_id")),
-                )
-            )
-        except KeyError:
-            continue
+        key = completed_prediction_key(pred)
+        if key is not None:
+            done.add(key)
     return done
 
 
@@ -1520,7 +1540,11 @@ def main():
         return
 
     summary_rows = []
-    all_predictions = load_json_list(checkpoint_paths["predictions"]) if args.resume else []
+    all_predictions = (
+        load_resume_predictions(checkpoint_paths["predictions"], output_dir, dataset, models)
+        if args.resume
+        else []
+    )
 
     for model_name in models:
         try:
