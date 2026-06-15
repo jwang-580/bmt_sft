@@ -25,6 +25,7 @@ Examples:
     python prompt_eval/evaluate_gemma4_extraction.py --dataset osu --modes baseline,no_reasoning,non_json --limit 3
     python prompt_eval/evaluate_gemma4_extraction.py --models google/gemma-4-E2B-it,google/gemma-4-E4B-it
     python prompt_eval/evaluate_gemma4_extraction.py --mode_fields_per_call baseline:25,non_json:5
+    python prompt_eval/evaluate_gemma4_extraction.py --skip_runs baseline:full:100
     python prompt_eval/evaluate_gemma4_extraction.py --note_strategy full  # disable baseline chunking
     python prompt_eval/evaluate_gemma4_extraction.py --all_fields  # evaluate every form question
     python prompt_eval/evaluate_gemma4_extraction.py --save_raw_runs  # opt-in raw JSONL debugging
@@ -355,6 +356,24 @@ def parse_mode_int_map(value):
     return mode_values
 
 
+def parse_skip_runs(value):
+    skip_runs = set()
+    for item in parse_csv_list(value):
+        parts = [part.strip() for part in item.split(":")]
+        if len(parts) != 3:
+            raise ValueError(f"Expected mode:note_strategy:fields_per_call in --skip_runs, got {item!r}.")
+        mode, note_strategy, raw_fields_per_call = parts
+        if mode not in DEFAULT_MODES:
+            raise ValueError(f"Unknown mode {mode!r} in --skip_runs.")
+        if note_strategy not in {"full", "chunked"}:
+            raise ValueError(f"Unknown note strategy {note_strategy!r} in --skip_runs.")
+        fields_per_call = int(raw_fields_per_call)
+        if fields_per_call <= 0:
+            raise ValueError("--skip_runs fields_per_call values must be positive.")
+        skip_runs.add((mode, note_strategy, fields_per_call))
+    return skip_runs
+
+
 def build_variant_fields_per_call_plan(modes, note_strategy_plan, baseline_values, comparison_value, mode_overrides):
     plan = {}
     for mode in modes:
@@ -366,6 +385,19 @@ def build_variant_fields_per_call_plan(modes, note_strategy_plan, baseline_value
             else:
                 plan[(mode, note_strategy)] = [comparison_value]
     return plan
+
+
+def apply_skip_runs(variant_plan, skip_runs):
+    if not skip_runs:
+        return variant_plan
+    return {
+        key: [
+            fields_per_call
+            for fields_per_call in fields_per_call_values
+            if (key[0], key[1], fields_per_call) not in skip_runs
+        ]
+        for key, fields_per_call_values in variant_plan.items()
+    }
 
 
 def build_note_strategy_plan(modes, strategy):
@@ -1157,6 +1189,14 @@ def main():
         default="",
         help="Comma-separated per-mode overrides, such as baseline:25,non_json:5.",
     )
+    parser.add_argument(
+        "--skip_runs",
+        default="",
+        help=(
+            "Comma-separated variants to skip as mode:note_strategy:fields_per_call, "
+            "such as baseline:full:100."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=5, help="Number of notes to evaluate.")
     parser.add_argument(
         "--field_limit",
@@ -1213,6 +1253,7 @@ def main():
     checkpoint_paths = concentrated_paths(output_dir, dataset, models)
     modes = parse_csv_list(args.modes)
     mode_fields_per_call = parse_mode_int_map(args.mode_fields_per_call)
+    skip_runs = parse_skip_runs(args.skip_runs)
     note_strategy_plan = build_note_strategy_plan(modes, args.note_strategy)
     variant_fields_per_call_plan = build_variant_fields_per_call_plan(
         modes,
@@ -1221,11 +1262,14 @@ def main():
         comparison_fields_per_call,
         mode_fields_per_call,
     )
+    variant_fields_per_call_plan = apply_skip_runs(variant_fields_per_call_plan, skip_runs)
     planned_fields_per_call_values = [
         fields_per_call
         for mode_values in variant_fields_per_call_plan.values()
         for fields_per_call in mode_values
     ]
+    if not planned_fields_per_call_values:
+        raise ValueError("No runs remain after applying --skip_runs.")
     question_metadata = load_question_metadata(args.questions)
     total_fields = len(question_metadata)
     field_ids = list(question_metadata)
@@ -1260,6 +1304,8 @@ def main():
     print(f"Modes: {modes}")
     print(f"Note strategy plan: {note_strategy_plan}")
     print(f"Variant fields per call plan: {variant_fields_per_call_plan}")
+    if skip_runs:
+        print(f"Skipped runs: {sorted(skip_runs)}")
     if any("chunked" in strategies for strategies in note_strategy_plan.values()):
         print(f"Chunk chars: {args.chunk_chars}")
         print(f"Chunk overlap chars: {args.chunk_overlap_chars}")
