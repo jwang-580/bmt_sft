@@ -1018,18 +1018,15 @@ def generate(model, tokenizer, torch, messages, max_new_tokens, temperature, top
         return_dict=True,
         add_generation_prompt=True,
         reasoning_effort=reasoning_effort,
-    )
-    device = resolve_model_device(model, torch)
+    ).to(resolve_model_device(model, torch))
 
-    # apply_chat_template may return a plain tensor or a dict
-    if isinstance(inputs, dict):
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        input_len = inputs["input_ids"].shape[-1]
-    else:
-        inputs = {"input_ids": inputs.to(device)}
-        input_len = inputs["input_ids"].shape[-1]
+    input_len = inputs["input_ids"].shape[-1]
 
-    generate_kwargs = {"max_new_tokens": max_new_tokens}
+    generate_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.eos_token_id,
+        "use_cache": True,
+    }
     if temperature > 0:
         generate_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
         # top_k=0 disables top-k filtering; only pass it when enabled.
