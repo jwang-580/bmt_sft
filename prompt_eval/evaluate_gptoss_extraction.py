@@ -2,10 +2,15 @@
 """
 Evaluate GPT-OSS (20B, 120B) prompt variants for CIBMTR Form 2400 extraction.
 
-Uses the Unsloth FastLanguageModel backend. GPT-OSS-20B is loaded at full
-precision and run in BF16; GPT-OSS-120B is loaded in 4-bit quantization to save
-VRAM. Both behaviors are the per-model default and can be overridden with
---load_in_4bit.
+Uses the HuggingFace Transformers backend with device_map="auto" sharding and a
+memory-efficient attention implementation (SDPA by default, override with
+--attn_implementation). GPT-OSS-20B is loaded at full precision and run in BF16;
+GPT-OSS-120B is loaded in 4-bit (bitsandbytes) quantization to save VRAM. Both
+behaviors are the per-model default and can be overridden with --load_in_4bit.
+
+The default model repos are the BF16 weights (unsloth/gpt-oss-*-BF16), which load
+cleanly under plain Transformers and allow bitsandbytes 4-bit quantization for
+the 120B model.
 
 GPT-OSS uses the harmony chat format with an analysis (reasoning) channel and a
 final channel. The generation is decoded keeping special tokens, then only the
@@ -67,14 +72,14 @@ if load_dotenv:
 
 
 DEFAULT_GPT_OSS_MODELS = {
-    "20b": "unsloth/gpt-oss-20b",
-    "120b": "unsloth/gpt-oss-120b",
+    "20b": "unsloth/gpt-oss-20b-BF16",
+    "120b": "unsloth/gpt-oss-120b-BF16",
 }
 
 # Per-model 4-bit defaults: 20B loads at full precision (BF16), 120B loads in 4-bit.
 _MODEL_4BIT_DEFAULTS = {
-    "unsloth/gpt-oss-20b": False,
-    "unsloth/gpt-oss-120b": True,
+    "unsloth/gpt-oss-20b-BF16": False,
+    "unsloth/gpt-oss-120b-BF16": True,
 }
 
 DEFAULT_MODES = [
@@ -889,7 +894,7 @@ def coerce_records(raw_records, note, field_ids, question_metadata, mode):
 
 
 # ---------------------------------------------------------------------------
-# Unsloth model loading
+# HuggingFace model loading
 # ---------------------------------------------------------------------------
 
 def model_load_in_4bit(model_name, cli_override):
@@ -899,29 +904,53 @@ def model_load_in_4bit(model_name, cli_override):
     return _MODEL_4BIT_DEFAULTS.get(model_name, False)
 
 
-def load_model(model_name, load_in_4bit, max_seq_length):
+def import_transformers_runtime():
     try:
         import torch
-        from unsloth import FastLanguageModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError(
-            "Missing runtime dependency. Install Unsloth before running inference: "
-            "pip install unsloth"
+            "Missing runtime dependency. Install Transformers, Accelerate, and PyTorch before running inference."
         ) from exc
+    return torch, AutoModelForCausalLM, AutoTokenizer
+
+
+def load_model(model_name, load_in_4bit, max_seq_length, attn_implementation):
+    torch, AutoModelForCausalLM, AutoTokenizer = import_transformers_runtime()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if max_seq_length:
+        tokenizer.model_max_length = max_seq_length
 
     print(
         f"Loading {model_name} "
         f"({'4-bit' if load_in_4bit else 'full precision BF16'}), "
-        f"max_seq_length={max_seq_length}"
+        f"attn_implementation={attn_implementation or 'default'}"
     )
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
-        max_seq_length=max_seq_length,
-        load_in_4bit=load_in_4bit,
-        dtype=torch.bfloat16,
-        full_finetuning=False,
-    )
-    FastLanguageModel.for_inference(model)
+
+    # device_map="auto" shards across all visible GPUs (and CPU/disk if needed),
+    # while a memory-efficient attention kernel (SDPA) avoids materializing the
+    # full attention-score matrix that the eager path would.
+    model_kwargs = {
+        "device_map": "auto",
+        "dtype": torch.bfloat16,
+    }
+    if attn_implementation:
+        model_kwargs["attn_implementation"] = attn_implementation
+    if load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise RuntimeError("4-bit loading requires bitsandbytes support in Transformers.") from exc
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    model.eval()
     print_model_placement(model, torch)
     return torch, model, tokenizer
 
@@ -1233,7 +1262,7 @@ def add_variant_metadata(predictions, dataset, mode, model_name, fields_per_call
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate GPT-OSS extraction prompt variants with Unsloth FastModel."
+        description="Evaluate GPT-OSS extraction prompt variants with HuggingFace Transformers."
     )
     parser.add_argument("--dataset", choices=["mimic", "osu"], default="mimic")
     parser.add_argument("--mimic_path", default="data/mimic_iv_bmt_initial_progression.csv")
@@ -1296,8 +1325,17 @@ def main():
         type=int,
         default=8192,
         help=(
-            "Maximum sequence length passed to FastLanguageModel.from_pretrained. "
-            "Recommended minimum 16384; GPT-OSS supports up to 131072."
+            "Tokenizer model_max_length (context budget hint). Default 8192; "
+            "GPT-OSS supports up to 131072."
+        ),
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        choices=["auto", "sdpa", "flash_attention_2", "eager"],
+        default="sdpa",
+        help=(
+            "Attention kernel for Transformers. sdpa (default) is memory-efficient; "
+            "flash_attention_2 needs flash-attn installed; auto lets Transformers choose."
         ),
     )
     parser.add_argument(
@@ -1423,6 +1461,7 @@ def main():
     print(f"Models: {models}")
     print(f"Model 4-bit settings: {model_4bit_map}")
     print(f"Max seq length: {args.max_seq_length}")
+    print(f"Attention implementation: {args.attn_implementation}")
     print(f"Modes: {modes}")
     print(f"Reasoning effort: {args.reasoning_effort}")
     print(f"Temperature: {args.temperature}  top_p: {args.top_p}  top_k: {args.top_k}")
@@ -1451,10 +1490,11 @@ def main():
                 model_name,
                 load_in_4bit=model_4bit_map[model_name],
                 max_seq_length=args.max_seq_length,
+                attn_implementation=None if args.attn_implementation == "auto" else args.attn_implementation,
             )
         except RuntimeError as exc:
             print(f"Error: {exc}")
-            print("Install guidance: pip install unsloth")
+            print("Install guidance: pip install -U transformers accelerate bitsandbytes torch")
             return
 
         for mode in modes:
