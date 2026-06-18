@@ -1294,7 +1294,7 @@ def main():
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=16384,
+        default=8192,
         help=(
             "Maximum sequence length passed to FastLanguageModel.from_pretrained. "
             "Recommended minimum 16384; GPT-OSS supports up to 131072."
