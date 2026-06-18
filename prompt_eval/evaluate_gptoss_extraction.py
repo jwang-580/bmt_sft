@@ -2,15 +2,15 @@
 """
 Evaluate GPT-OSS (20B, 120B) prompt variants for CIBMTR Form 2400 extraction.
 
-Uses the HuggingFace Transformers backend with device_map="auto" sharding and a
-memory-efficient attention implementation (SDPA by default, override with
---attn_implementation). GPT-OSS-20B is loaded at full precision and run in BF16;
-GPT-OSS-120B is loaded in 4-bit (bitsandbytes) quantization to save VRAM. Both
-behaviors are the per-model default and can be overridden with --load_in_4bit.
+Uses the HuggingFace Transformers backend with the official GPT-OSS repos
+(openai/gpt-oss-20b, openai/gpt-oss-120b) and device_map="auto" sharding. These
+models ship in MXFP4; with dtype="auto" Transformers keeps MXFP4 where the
+kernels are available and otherwise dequantizes to BF16. Attention uses a
+memory-efficient implementation (SDPA by default, override --attn_implementation).
 
-The default model repos are the BF16 weights (unsloth/gpt-oss-*-BF16), which load
-cleanly under plain Transformers and allow bitsandbytes 4-bit quantization for
-the 120B model.
+--load_in_4bit is an opt-in bitsandbytes path for non-MXFP4 (BF16) checkpoints; it
+is off by default and is not needed for (nor compatible with) the MXFP4 official
+repos, which are already ~4-bit on disk.
 
 GPT-OSS uses the harmony chat format with an analysis (reasoning) channel and a
 final channel. The generation is decoded keeping special tokens, then only the
@@ -39,7 +39,7 @@ Examples:
     python prompt_eval/evaluate_gptoss_extraction.py --dataset mimic --limit 5 --fields_per_call 1,5,25
     python prompt_eval/evaluate_gptoss_extraction.py --dataset osu --modes baseline,no_reasoning,non_json --limit 3
     python prompt_eval/evaluate_gptoss_extraction.py --models 20b,120b
-    python prompt_eval/evaluate_gptoss_extraction.py --models 20b --load_in_4bit
+    python prompt_eval/evaluate_gptoss_extraction.py --models 20b --reasoning_effort high
     python prompt_eval/evaluate_gptoss_extraction.py --mode_fields_per_call baseline:25,non_json:5
     python prompt_eval/evaluate_gptoss_extraction.py --skip_runs baseline:full:100
     python prompt_eval/evaluate_gptoss_extraction.py --note_strategy full  # disable baseline chunking
@@ -72,14 +72,8 @@ if load_dotenv:
 
 
 DEFAULT_GPT_OSS_MODELS = {
-    "20b": "unsloth/gpt-oss-20b-BF16",
-    "120b": "unsloth/gpt-oss-120b-BF16",
-}
-
-# Per-model 4-bit defaults: 20B loads at full precision (BF16), 120B loads in 4-bit.
-_MODEL_4BIT_DEFAULTS = {
-    "unsloth/gpt-oss-20b-BF16": False,
-    "unsloth/gpt-oss-120b-BF16": True,
+    "20b": "openai/gpt-oss-20b",
+    "120b": "openai/gpt-oss-120b",
 }
 
 DEFAULT_MODES = [
@@ -897,13 +891,6 @@ def coerce_records(raw_records, note, field_ids, question_metadata, mode):
 # HuggingFace model loading
 # ---------------------------------------------------------------------------
 
-def model_load_in_4bit(model_name, cli_override):
-    """Return True if this model should be loaded in 4-bit quantization."""
-    if cli_override is not None:
-        return cli_override
-    return _MODEL_4BIT_DEFAULTS.get(model_name, False)
-
-
 def import_transformers_runtime():
     try:
         import torch
@@ -922,16 +909,17 @@ def load_model(model_name, load_in_4bit, attn_implementation):
 
     print(
         f"Loading {model_name} "
-        f"({'4-bit' if load_in_4bit else 'full precision BF16'}), "
+        f"({'bitsandbytes 4-bit' if load_in_4bit else 'native (MXFP4/BF16 auto)'}), "
         f"attn_implementation={attn_implementation or 'default'}"
     )
 
     # device_map="auto" shards across all visible GPUs (and CPU/disk if needed),
     # while a memory-efficient attention kernel (SDPA) avoids materializing the
-    # full attention-score matrix that the eager path would.
+    # full attention-score matrix that the eager path would. dtype="auto" keeps
+    # the MXFP4 weights where supported and otherwise dequantizes to BF16.
     model_kwargs = {
         "device_map": "auto",
-        "dtype": torch.bfloat16,
+        "dtype": "auto",
     }
     if attn_implementation:
         model_kwargs["attn_implementation"] = attn_implementation
@@ -1280,8 +1268,8 @@ def main():
         default="20b",
         help=(
             "Comma-separated model aliases or HF names. "
-            "Aliases: 20b=openai/gpt-oss-20b (full precision BF16), "
-            "120b=openai/gpt-oss-120b (4-bit)."
+            "Aliases: 20b=openai/gpt-oss-20b, 120b=openai/gpt-oss-120b "
+            "(both MXFP4, loaded natively / dequantized to BF16)."
         ),
     )
     parser.add_argument("--modes", default=",".join(DEFAULT_MODES), help="Comma-separated prompt modes.")
@@ -1342,10 +1330,9 @@ def main():
     parser.add_argument(
         "--load_in_4bit",
         action="store_true",
-        default=None,
         help=(
-            "Force 4-bit quantization for all models. "
-            "Default: 20b=False (full precision BF16), 120b=True (4-bit)."
+            "Opt-in bitsandbytes 4-bit quantization. Off by default. Only valid for "
+            "non-MXFP4 (BF16) checkpoints; not compatible with the official MXFP4 repos."
         ),
     )
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -1440,15 +1427,11 @@ def main():
         gold_path = args.gold_json
     gold = load_gold_answers(gold_path)
 
-    # Determine per-model 4-bit settings
-    cli_4bit_override = args.load_in_4bit if args.load_in_4bit else None
-    model_4bit_map = {m: model_load_in_4bit(m, cli_4bit_override) for m in models}
-
     print(f"Dataset: {dataset}")
     print(f"Notes: {len(notes)}")
     print(f"Fields: {len(field_ids)} of {total_fields} ({field_selection})")
     print(f"Models: {models}")
-    print(f"Model 4-bit settings: {model_4bit_map}")
+    print(f"Load in 4-bit: {bool(args.load_in_4bit)}")
     print(f"Attention implementation: {args.attn_implementation}")
     print(f"Modes: {modes}")
     print(f"Reasoning effort: {args.reasoning_effort}")
@@ -1476,7 +1459,7 @@ def main():
         try:
             torch, model, tokenizer = load_model(
                 model_name,
-                load_in_4bit=model_4bit_map[model_name],
+                load_in_4bit=bool(args.load_in_4bit),
                 attn_implementation=None if args.attn_implementation == "auto" else args.attn_implementation,
             )
         except RuntimeError as exc:
