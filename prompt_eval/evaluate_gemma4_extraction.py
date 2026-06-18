@@ -927,7 +927,29 @@ def extract_thought(response):
     return thought.strip()
 
 
+def _is_multimodal_processor(processor):
+    """True for vision-language processors (e.g. Gemma3Processor)."""
+    return hasattr(processor, "image_processor") or "Processor" in type(processor).__name__
+
+
+def format_messages_for_processor(messages, processor):
+    """Wrap plain-string message content into typed text parts for multimodal
+    processors, which require content as a list of {"type": ...} dicts. Plain
+    tokenizers accept strings directly, so they are left unchanged."""
+    if not _is_multimodal_processor(processor):
+        return messages
+    formatted = []
+    for msg in messages:
+        content = msg["content"]
+        if isinstance(content, str):
+            formatted.append({**msg, "content": [{"type": "text", "text": content}]})
+        else:
+            formatted.append(msg)
+    return formatted
+
+
 def generate(model, processor, torch, messages, max_new_tokens, temperature, top_p, top_k, enable_thinking):
+    messages = format_messages_for_processor(messages, processor)
     inputs = processor.apply_chat_template(
         messages,
         tokenize=True,
