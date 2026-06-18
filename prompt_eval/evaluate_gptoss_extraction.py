@@ -1309,10 +1309,12 @@ def main():
     parser.add_argument(
         "--attn_implementation",
         choices=["auto", "sdpa", "flash_attention_2", "eager"],
-        default="sdpa",
+        default="auto",
         help=(
-            "Attention kernel for Transformers. sdpa (default) is memory-efficient; "
-            "flash_attention_2 needs flash-attn installed; auto lets Transformers choose."
+            "Attention kernel for Transformers. auto (default) lets Transformers pick the "
+            "model's supported default (GptOss does not support sdpa in all versions). "
+            "flash_attention_2 is most memory-efficient but needs flash-attn installed; "
+            "eager always works but materializes the full attention matrix."
         ),
     )
     parser.add_argument(
