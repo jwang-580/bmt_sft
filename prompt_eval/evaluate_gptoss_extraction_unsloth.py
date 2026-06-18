@@ -2,10 +2,11 @@
 """
 Evaluate GPT-OSS (20B, 120B) prompt variants for CIBMTR Form 2400 extraction.
 
-Uses the Unsloth FastLanguageModel backend. GPT-OSS-20B is loaded at full
-precision and run in BF16; GPT-OSS-120B is loaded in 4-bit quantization to save
-VRAM. Both behaviors are the per-model default and can be overridden with
---load_in_4bit.
+Uses the Unsloth FastLanguageModel backend with dtype=None, which keeps GPT-OSS
+in its native MXFP4 weights and computes in BF16 (matching the official
+GPT_OSS_MXFP4 inference notebook). GPT-OSS-20B is loaded this way; GPT-OSS-120B
+is loaded in 4-bit quantization to save VRAM. Both behaviors are the per-model
+default and can be overridden with --load_in_4bit.
 
 To bound the eager-attention memory of the Unsloth GPT-OSS path (which scales
 with the square of the input length), the clinical note is truncated so the full
@@ -917,14 +918,18 @@ def load_model(model_name, load_in_4bit, max_seq_length):
 
     print(
         f"Loading {model_name} "
-        f"({'4-bit' if load_in_4bit else 'full precision BF16'}), "
+        f"({'4-bit' if load_in_4bit else 'native MXFP4 (bf16 compute)'}), "
         f"max_seq_length={max_seq_length}"
     )
+    # dtype=None lets Unsloth keep GPT-OSS in its native MXFP4 format and compute
+    # in bf16. Forcing dtype=torch.bfloat16 dequantizes into Unsloth's BF16 MoE
+    # inference kernel, which currently has a gate_up_proj shape bug. This mirrors
+    # the official GPT_OSS_MXFP4_(20B)-Inference notebook.
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
         max_seq_length=max_seq_length,
         load_in_4bit=load_in_4bit,
-        dtype=torch.bfloat16,
+        dtype=None,
         full_finetuning=False,
     )
     FastLanguageModel.for_inference(model)
