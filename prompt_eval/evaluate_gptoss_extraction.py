@@ -915,12 +915,10 @@ def import_transformers_runtime():
     return torch, AutoModelForCausalLM, AutoTokenizer
 
 
-def load_model(model_name, load_in_4bit, max_seq_length, attn_implementation):
+def load_model(model_name, load_in_4bit, attn_implementation):
     torch, AutoModelForCausalLM, AutoTokenizer = import_transformers_runtime()
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if max_seq_length:
-        tokenizer.model_max_length = max_seq_length
 
     print(
         f"Loading {model_name} "
@@ -1321,15 +1319,6 @@ def main():
     parser.add_argument("--all_fields", action="store_true", help="Evaluate every form field unless --field_limit is set.")
     parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument(
-        "--max_seq_length",
-        type=int,
-        default=8192,
-        help=(
-            "Tokenizer model_max_length (context budget hint). Default 8192; "
-            "GPT-OSS supports up to 131072."
-        ),
-    )
-    parser.add_argument(
         "--attn_implementation",
         choices=["auto", "sdpa", "flash_attention_2", "eager"],
         default="sdpa",
@@ -1460,7 +1449,6 @@ def main():
     print(f"Fields: {len(field_ids)} of {total_fields} ({field_selection})")
     print(f"Models: {models}")
     print(f"Model 4-bit settings: {model_4bit_map}")
-    print(f"Max seq length: {args.max_seq_length}")
     print(f"Attention implementation: {args.attn_implementation}")
     print(f"Modes: {modes}")
     print(f"Reasoning effort: {args.reasoning_effort}")
@@ -1489,7 +1477,6 @@ def main():
             torch, model, tokenizer = load_model(
                 model_name,
                 load_in_4bit=model_4bit_map[model_name],
-                max_seq_length=args.max_seq_length,
                 attn_implementation=None if args.attn_implementation == "auto" else args.attn_implementation,
             )
         except RuntimeError as exc:
