@@ -33,6 +33,7 @@ Examples:
 
 import argparse
 import csv
+import gc
 import json
 import os
 import re
@@ -1620,6 +1621,9 @@ def main():
                     summary_rows.append(metrics)
                     write_json(checkpoint_paths["predictions"], all_predictions)
                     print(json.dumps(metrics, indent=2))
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         del model
         del processor
