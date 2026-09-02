@@ -62,6 +62,27 @@ from datetime import datetime
 from pathlib import Path
 
 try:
+    from .extraction_prompts import (
+        DEFAULT_MODES,
+        JSON_MODE_FIELDS,
+        build_questions_block,
+        build_synthesis_prompt,
+        build_system_prompt,
+        build_user_prompt,
+        mode_settings,
+    )
+except ImportError:
+    from extraction_prompts import (
+        DEFAULT_MODES,
+        JSON_MODE_FIELDS,
+        build_questions_block,
+        build_synthesis_prompt,
+        build_system_prompt,
+        build_user_prompt,
+        mode_settings,
+    )
+
+try:
     from dotenv import load_dotenv
 except ImportError:
     load_dotenv = None
@@ -84,23 +105,6 @@ DEFAULT_GPT_OSS_MODELS = {
 _MODEL_4BIT_DEFAULTS = {
     "unsloth/gpt-oss-20b-BF16": False,
     "unsloth/gpt-oss-120b-BF16": True,
-}
-
-DEFAULT_MODES = [
-    "baseline",
-    "non_json",
-    "no_reasoning",
-    "few_shot",
-    "no_reasoning_trace_field",
-    "no_evidence_field",
-]
-
-JSON_MODE_FIELDS = {
-    "baseline": ["evidence_from_text", "reasoning_trace"],
-    "few_shot": ["evidence_from_text", "reasoning_trace"],
-    "no_reasoning": ["evidence_from_text"],
-    "no_reasoning_trace_field": ["evidence_from_text"],
-    "no_evidence_field": ["reasoning_trace"],
 }
 
 EMPTY_ANSWER_STRINGS = {"", "N/A", "NA", "NONE", "NULL", "NOT FOUND", "UNKNOWN"}
@@ -551,244 +555,6 @@ def progress_bar(iterable=None, **kwargs):
 
 # ---------------------------------------------------------------------------
 # Prompt construction
-# ---------------------------------------------------------------------------
-
-def build_questions_block(field_ids, question_metadata):
-    blocks = []
-    for field_id in field_ids:
-        field = question_metadata[field_id]
-        block = [
-            f"Field {field_id}",
-            f"Category: {field['field_category']}",
-            f"Field name: {field['field_name']}",
-        ]
-        if field["field_instructions"] and field["field_instructions"] != "[]":
-            block.append(f"Options/Instructions: {field['field_instructions']}")
-        blocks.append("\n".join(block))
-    return "\n\n".join(blocks)
-
-
-def few_shot_block():
-    return """Few-shot examples:
-
-Example 1 clinical text:
-Patient admitted for allogeneic matched sibling peripheral blood stem cell transplant. Donor is male. GVHD prophylaxis tacrolimus and methotrexate.
-
-Example 1 answer:
-[
-  {
-    "field_id": "32",
-    "field_category": "donor_information",
-    "field_name": "Specify donor",
-    "field_instructions": "['Autologous', 'Allogeneic, related', 'Allogeneic, unrelated']",
-    "answers": "Allogeneic, related",
-    "evidence_from_text": "allogeneic matched sibling",
-    "reasoning_trace": "Matched sibling indicates a related allogeneic donor."
-  },
-  {
-    "field_id": "33",
-    "field_category": "donor_information",
-    "field_name": "Specify product type (check all that apply)",
-    "field_instructions": "['Bone marrow - Go to question 35', 'PBSC - Go to question 35']",
-    "answers": ["PBSC - Go to question 35"],
-    "evidence_from_text": "peripheral blood stem cell transplant",
-    "reasoning_trace": "Peripheral blood stem cell transplant maps to PBSC."
-  }
-]
-
-Example 2 clinical text:
-The note does not mention health insurance.
-
-Example 2 answer:
-[
-  {
-    "field_id": "17",
-    "field_category": "recipient_information",
-    "field_name": "Specify type of health insurance (check all that apply)",
-    "field_instructions": "",
-    "answers": "N/A",
-    "evidence_from_text": "",
-    "reasoning_trace": ""
-  }
-]"""
-
-
-def mode_settings(mode):
-    if mode not in DEFAULT_MODES:
-        raise ValueError(f"Unknown mode {mode}. Valid modes: {', '.join(DEFAULT_MODES)}")
-    return {
-        "json": mode != "non_json",
-        "few_shot": mode == "few_shot",
-        "extra_fields": JSON_MODE_FIELDS.get(mode, []),
-    }
-
-
-def build_system_prompt():
-    return (
-        "You are a careful clinical information extraction system for BMT notes. "
-        + "Extract only information supported by the supplied note. "
-        + "Use standard CIBMTR Form 2400 option wording when an option list is supplied."
-    )
-
-
-def build_user_prompt(note, field_ids, question_metadata, mode):
-    settings = mode_settings(mode)
-    questions = build_questions_block(field_ids, question_metadata)
-    common = f"""Record:
-{note['record_id_type']}: {note['record_id']}
-date: {note['date']}
-
-Clinical note:
-{note['note']}
-
-Fields:
-
-{questions}
-"""
-
-    if settings["few_shot"]:
-        common = few_shot_block() + "\n\nNow extract from the target note.\n\n" + common
-
-    if not settings["json"]:
-        ordered_field_ids = ", ".join(field_ids)
-        return (
-            common
-            + f"""
-Return plain text only.
-
-You must output exactly one line for every requested field id below, in this exact order:
-{ordered_field_ids}
-
-Use exactly this format for every line:
-Field <field_id>: <answer>
-
-Do not stop after the first answer. If an answer is not found, still include the line and use N/A."""
-        )
-
-    keys = [
-        "record_id",
-        "record_id_type",
-        "date",
-        "field_id",
-        "field_category",
-        "field_name",
-        "field_instructions",
-        "answers",
-    ] + settings["extra_fields"]
-
-    field_guidance = []
-    if "evidence_from_text" in settings["extra_fields"]:
-        field_guidance.append(
-            '- evidence_from_text must be a concise quote or paraphrase from the note. Use "" for N/A answers.'
-        )
-    if "reasoning_trace" in settings["extra_fields"]:
-        field_guidance.append(
-            '- reasoning_trace must be a brief visible rationale. Use "" for N/A answers.'
-        )
-
-    return (
-        common
-        + f"""
-Return a JSON array with exactly one object per field. Each object must have these keys:
-{json.dumps(keys)}
-
-Rules:
-- Use the exact record_id, record_id_type, date, field_id, field_category, field_name, and field_instructions supplied in the prompt.
-- Put the extracted answer in answers. Use "N/A" if the answer is not found.
-- For check-all-that-apply fields, answers may be an array of selected options.
-{chr(10).join(field_guidance)}
-- Do not add any extra text outside the JSON array."""
-    )
-
-
-def build_synthesis_prompt(note, field_ids, question_metadata, mode, chunk_predictions):
-    settings = mode_settings(mode)
-    questions = build_questions_block(field_ids, question_metadata)
-    compact_predictions = [
-        {
-            "chunk_index": prediction.get("chunk_index"),
-            "field_id": prediction.get("field_id"),
-            "field_name": prediction.get("field_name"),
-            "answers": prediction.get("answers", "N/A"),
-            "evidence_from_text": prediction.get("evidence_from_text", ""),
-            "parse_error": prediction.get("parse_error", ""),
-        }
-        for prediction in chunk_predictions
-    ]
-    common = f"""Record:
-{note['record_id_type']}: {note['record_id']}
-date: {note['date']}
-
-Fields:
-
-{questions}
-
-Chunk-level extractions:
-{json.dumps(compact_predictions, indent=2, ensure_ascii=False)}
-"""
-
-    if not settings["json"]:
-        ordered_field_ids = ", ".join(field_ids)
-        return (
-            common
-            + f"""
-Synthesize one final answer per field using the chunk-level extractions.
-Prefer supported non-empty answers over N/A. Use N/A only when no chunk supports
-an answer.
-
-Return plain text only.
-
-You must output exactly one line for every requested field id below, in this exact order:
-{ordered_field_ids}
-
-Use exactly this format for every line:
-Field <field_id>: <answer>
-
-Do not stop after the first answer. If an answer is not found, still include the line and use N/A."""
-        )
-
-    keys = [
-        "record_id",
-        "record_id_type",
-        "date",
-        "field_id",
-        "field_category",
-        "field_name",
-        "field_instructions",
-        "answers",
-    ] + settings["extra_fields"]
-
-    field_guidance = []
-    if "evidence_from_text" in settings["extra_fields"]:
-        field_guidance.append(
-            '- evidence_from_text must summarize the best supporting chunk evidence. Use "" for N/A answers.'
-        )
-    if "reasoning_trace" in settings["extra_fields"]:
-        field_guidance.append(
-            '- reasoning_trace must be a brief visible rationale. Use "" for N/A answers.'
-        )
-
-    return (
-        common
-        + f"""
-Synthesize one final answer per field using the chunk-level extractions.
-Prefer supported non-empty answers over N/A. Use N/A only when no chunk supports
-an answer. Resolve conflicts conservatively using the most specific supported
-evidence.
-
-Return a JSON array with exactly one object per field. Each object must have these keys:
-{json.dumps(keys)}
-
-Rules:
-- Use the exact record_id, record_id_type, date, field_id, field_category, field_name, and field_instructions supplied in the prompt.
-- Put the final synthesized answer in answers.
-{chr(10).join(field_guidance)}
-- Do not add any extra text outside the JSON array."""
-    )
-
-
-# ---------------------------------------------------------------------------
-# Output parsing
 # ---------------------------------------------------------------------------
 
 def parse_json_generation(text):
