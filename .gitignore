@@ -6,3 +6,4 @@ prompt_eval/results/
 *.sh
 *.err
 *.out
+outputs/*

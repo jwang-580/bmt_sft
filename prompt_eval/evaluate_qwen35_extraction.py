@@ -305,6 +305,22 @@ def is_empty_answer(value):
     return False
 
 
+def answers_match(field_id, predicted_answer, gold_answer):
+    """Return whether an answer is correct, including field-specific equivalences."""
+    if normalize_question_number(field_id) == "31":
+        predicted_is_single_or_empty = (
+            is_empty_answer(predicted_answer) or normalize_answer(predicted_answer) == "1"
+        )
+        gold_is_single_or_empty = (
+            is_empty_answer(gold_answer) or normalize_answer(gold_answer) == "1"
+        )
+        if predicted_is_single_or_empty and gold_is_single_or_empty:
+            return True
+    return (
+        is_empty_answer(predicted_answer) and is_empty_answer(gold_answer)
+    ) or normalize_answer(predicted_answer) == normalize_answer(gold_answer)
+
+
 def question_number_column(rows):
     if not rows:
         raise ValueError("Question CSV is empty.")
@@ -1269,12 +1285,10 @@ def evaluate_predictions(predictions, gold):
         covered += 1
         gold_answer = gold[key]
         pred_answer = pred.get("answers", "N/A")
-        if (
-            is_empty_answer(pred_answer)
-            and is_empty_answer(gold_answer)
-        ) or normalize_answer(pred_answer) == normalize_answer(gold_answer):
+        exact_match = answers_match(key[1], pred_answer, gold_answer)
+        if exact_match:
             exact += 1
-        if is_empty_answer(pred_answer) == is_empty_answer(gold_answer):
+        if exact_match or is_empty_answer(pred_answer) == is_empty_answer(gold_answer):
             empty_match += 1
 
     return {
