@@ -30,24 +30,22 @@ from typing import Any, Iterable
 
 from dotenv import load_dotenv
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from prompt_eval.extraction_prompts import (
+    ANNOTATION_SYSTEM_PROMPT,
+    EXTRACTION_SYSTEM_PROMPT as TRAINING_SYSTEM_PROMPT,
+    build_annotation_user_prompt,
+    build_questions_block,
+    build_sft_user_prompt,
+)
+
 
 DEFAULT_MODEL = "gemini-3.7-flash"
 DEFAULT_OUTPUT_DIR = "fine_tuning/outputs/mimic_gemini37_flash_sft_fpc5"
 EMPTY_ANSWERS = {"", "N/A", "NA", "NONE", "NULL", "NOT FOUND", "UNKNOWN"}
-
-ANNOTATION_SYSTEM_PROMPT = """You create high-quality supervised fine-tuning annotations for clinical information extraction.
-
-The ground-truth answer supplied for each field is fixed and authoritative. Do not revise, reinterpret, normalize, or replace it. Your task is only to add:
-1. evidence_from_text: the shortest exact quote from the clinical note that supports the fixed answer. Use an empty string when the answer is unsupported because the information is absent, unknown, or not applicable.
-2. reasoning_trace: one brief, visible rationale explaining how the evidence or form branching supports the fixed answer. This is a concise annotation, not hidden chain-of-thought.
-
-Do not introduce facts that are not present in the note or implied by the supplied form instructions."""
-
-TRAINING_SYSTEM_PROMPT = (
-    "You are a careful clinical information extraction system for BMT notes. "
-    "Extract only information supported by the supplied note. "
-    "Use standard CIBMTR Form 2400 option wording when an option list is supplied."
-)
 
 
 @dataclass(frozen=True)
@@ -208,51 +206,31 @@ def field_payload(field: Field, answer: Any | None = None) -> dict[str, Any]:
 
 def build_annotation_prompt(note: Note, fields: list[Field], answers: dict[str, Any]) -> str:
     supplied = [field_payload(field, answers[field.field_id]) for field in fields]
-    return f"""Record:
-hadm_id: {note.record_id}
-date: {note.date}
-
-Clinical note:
-{note.text}
-
-Fields and fixed ground-truth answers:
-{json.dumps(supplied, ensure_ascii=False, indent=2)}
-
-Return exactly one annotation for every supplied field, in the same order. Copy each field_id exactly. Do not return or alter the fixed answer. For an N/A, unknown, or not-applicable answer, evidence_from_text may be empty, but reasoning_trace must still briefly explain absence or form-branch logic."""
+    return build_annotation_user_prompt(
+        record_id=note.record_id,
+        date=note.date,
+        note_text=note.text,
+        supplied_fields=supplied,
+    )
 
 
 def build_training_user_prompt(note: Note, fields: list[Field]) -> str:
-    blocks: list[str] = []
-    for field in fields:
-        lines = [
-            f"Field {field.field_id}",
-            f"Category: {field.category}",
-            f"Field name: {field.name}",
-        ]
-        if field.instructions and field.instructions != "[]":
-            lines.append(f"Options/Instructions: {field.instructions}")
-        blocks.append("\n".join(lines))
-    return f"""Record:
-hadm_id: {note.record_id}
-date: {note.date}
-
-Clinical note:
-{note.text}
-
-Fields:
-
-{chr(10).join(chr(10) + block for block in blocks).lstrip()}
-
-Return a JSON array with exactly one object per field. Each object must have these keys:
-["record_id", "record_id_type", "date", "field_id", "field_category", "field_name", "field_instructions", "answers", "evidence_from_text", "reasoning_trace"]
-
-Rules:
-- Use the exact metadata supplied in the prompt.
-- Put the extracted answer in answers. Use "N/A" when the answer is not found.
-- For check-all-that-apply fields, answers may be an array of selected options.
-- evidence_from_text must be a concise exact quote from the note. Use "" when no supporting text exists.
-- reasoning_trace must be one brief visible rationale, not hidden chain-of-thought.
-- Do not add any text outside the JSON array."""
+    field_ids = [field.field_id for field in fields]
+    question_metadata = {
+        field.field_id: {
+            "field_category": field.category,
+            "field_name": field.name,
+            "field_instructions": field.instructions,
+        }
+        for field in fields
+    }
+    return build_sft_user_prompt(
+        record_id=note.record_id,
+        record_id_type="hadm_id",
+        date=note.date,
+        note_text=note.text,
+        fields_block=build_questions_block(field_ids, question_metadata),
+    )
 
 
 def response_schema(expected_count: int) -> dict[str, Any]:
