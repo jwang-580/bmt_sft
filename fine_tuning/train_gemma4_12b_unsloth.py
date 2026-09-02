@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_FILE = REPO_ROOT / "fine_tuning" / "outputs" / "mimic_sft_fpc5_train.jsonl"
 DEFAULT_EVAL_IDS = REPO_ROOT / "fine_tuning" / "mimic_eval_record_ids.json"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "fine_tuning" / "outputs" / "gemma4_12b_lora"
-DEFAULT_MODEL = "unsloth/gemma-4-12b-it"
+DEFAULT_MODEL = "google/gemma-4-12B-it"
 DEFAULT_MIMIC_FILE = REPO_ROOT / "data" / "mimic_iv_bmt_initial_progression.csv"
 DEFAULT_QUESTIONS_FILE = REPO_ROOT / "data" / "CIBMTR_Form_2400_R11_Items_simplified.csv"
 DEFAULT_GOLD_FILE = REPO_ROOT / "data" / "mimic_form_2400_answers.json"
@@ -436,6 +436,7 @@ def main() -> int:
             save_total_limit=args.save_total_limit,
             dataset_num_proc=args.dataset_num_proc,
             packing=False,
+            padding_free=False,
         ),
     )
     trainer = train_on_responses_only(trainer)
