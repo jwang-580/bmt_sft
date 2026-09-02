@@ -345,6 +345,7 @@ def main() -> int:
         "epochs": args.epochs,
         "max_steps": args.max_steps,
         "effective_batch_size": args.per_device_train_batch_size * args.gradient_accumulation_steps,
+        "optimizer": "adamw_torch_fused",
         "report_to": "wandb",
         "wandb_project": args.wandb_project,
         "wandb_run_name": args.wandb_run_name,
@@ -423,7 +424,10 @@ def main() -> int:
             max_steps=args.max_steps,
             learning_rate=args.learning_rate,
             logging_steps=args.logging_steps,
-            optim="adamw_8bit",
+            # Avoid bitsandbytes' native 8-bit optimizer. It is unnecessary for
+            # LoRA here and can require CUDA toolkit libraries (for example,
+            # libnvJitLink.so.13) that are not part of the PyTorch CUDA runtime.
+            optim="adamw_torch_fused",
             weight_decay=args.weight_decay,
             lr_scheduler_type="linear",
             seed=args.seed,
