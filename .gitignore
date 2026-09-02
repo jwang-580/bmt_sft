@@ -8,3 +8,4 @@ prompt_eval/results/
 *.out
 outputs/*
 unsloth_compiled_cache/*
+wandb/*
