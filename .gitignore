@@ -7,3 +7,4 @@ prompt_eval/results/
 *.err
 *.out
 outputs/*
+unsloth_compiled_cache/*

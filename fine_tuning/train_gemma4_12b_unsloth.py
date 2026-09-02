@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_total_limit", type=int, default=2)
     parser.add_argument("--dataset_num_proc", type=int, default=2)
     parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--wandb_project", default="bmt-sft")
+    parser.add_argument("--wandb_run_name", default="gemma4-12b-lora-r16")
     parser.add_argument("--resume_from_checkpoint", nargs="?", const=True, default=None)
     parser.add_argument(
         "--skip_eval",
@@ -302,6 +305,21 @@ def run_held_out_validation(
         }
     )
     write_json(eval_dir / "held_out_metrics.json", metrics)
+    try:
+        import wandb
+
+        if wandb.run is not None:
+            wandb.log(
+                {
+                    f"held_out/{name}": value
+                    for name, value in metrics.items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+            )
+        else:
+            print("Warning: the W&B run was not active when held-out metrics were produced.")
+    except ImportError:
+        print("Warning: wandb is unavailable; held-out metrics were saved locally only.")
     print(json.dumps(metrics, indent=2))
     return metrics
 
@@ -327,6 +345,9 @@ def main() -> int:
         "epochs": args.epochs,
         "max_steps": args.max_steps,
         "effective_batch_size": args.per_device_train_batch_size * args.gradient_accumulation_steps,
+        "report_to": "wandb",
+        "wandb_project": args.wandb_project,
+        "wandb_run_name": args.wandb_run_name,
         "trainer_eval_dataset": None,
         "held_out_validation": not args.skip_eval,
         "held_out_validation_mode": "baseline",
@@ -339,16 +360,26 @@ def main() -> int:
 
     try:
         import torch
-        from datasets import load_dataset
-        from trl import SFTConfig, SFTTrainer
+        # Unsloth must be imported before TRL/Transformers trainer classes so
+        # its patches are applied before SFTConfig and SFTTrainer are bound.
         from unsloth import FastModel, is_bfloat16_supported
         from unsloth.chat_templates import get_chat_template, train_on_responses_only
+        from datasets import load_dataset
+        import transformers
+        import trl
+        from trl import SFTConfig, SFTTrainer
     except ImportError as exc:
         raise RuntimeError(
             "Missing fine-tuning dependencies. Install fine_tuning/requirements.txt in the CUDA environment."
         ) from exc
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
+    torch._dynamo.config.recompile_limit = 64
+    print(
+        f"Runtime versions: transformers={transformers.__version__}, "
+        f"trl={trl.__version__}"
+    )
     model, tokenizer = FastModel.from_pretrained(
         model_name=args.model_name,
         dtype=None,
@@ -369,18 +400,22 @@ def main() -> int:
         random_state=args.seed,
     )
     tokenizer = get_chat_template(tokenizer, chat_template="gemma-4")
+    training_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    if getattr(training_tokenizer, "chat_template", None) is None:
+        training_tokenizer.chat_template = tokenizer.chat_template
 
     dataset = load_dataset("json", data_files=str(args.train_file), split="train")
     dataset = format_dataset(dataset, tokenizer, args.dataset_num_proc)
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=training_tokenizer,
         train_dataset=dataset,
         eval_dataset=None,
         args=SFTConfig(
             output_dir=str(args.output_dir),
             dataset_text_field="text",
+            max_length=args.max_seq_length,
             per_device_train_batch_size=args.per_device_train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             warmup_ratio=args.warmup_ratio,
@@ -394,7 +429,8 @@ def main() -> int:
             seed=args.seed,
             bf16=is_bfloat16_supported(),
             fp16=not is_bfloat16_supported(),
-            report_to="none",
+            report_to="wandb",
+            run_name=args.wandb_run_name,
             save_strategy="steps",
             save_steps=args.save_steps,
             save_total_limit=args.save_total_limit,

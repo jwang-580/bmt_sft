@@ -4,9 +4,10 @@ python-dotenv>=1.0.0
 # Gemma 4 fine-tuning stack used by train_gemma4_12b_unsloth.py.
 unsloth
 datasets==4.3.0
-transformers==5.5.0
+transformers==5.10.1
 tokenizers>=0.22.0,<=0.23.0
-trl
+trl==0.24.0
 peft
 accelerate
 bitsandbytes
+wandb
