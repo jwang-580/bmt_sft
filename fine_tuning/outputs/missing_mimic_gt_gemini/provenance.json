@@ -1,0 +1,22 @@
+{
+  "model": "gemini-3.7-flash",
+  "target_record_ids": [
+    "26612663",
+    "26612664"
+  ],
+  "records": 2,
+  "fields": 129,
+  "fields_per_call": 5,
+  "total_calls": 52,
+  "completed_calls": 52,
+  "pending_calls": 0,
+  "ground_truth_file": "C:\\Users\\JasonW\\PycharmProjects\\bmt_sft\\data\\mimic_form_2400_answers.json",
+  "pseudo_ground_truth": true,
+  "generated_at_utc": "2026-09-02T15:40:36.921729+00:00",
+  "annotation_status": "model_generated_not_human_adjudicated",
+  "backup_file": "C:\\Users\\JasonW\\PycharmProjects\\bmt_sft\\data\\mimic_form_2400_answers.before_gemini_20260902-154036.json",
+  "annotations_file": "C:\\Users\\JasonW\\PycharmProjects\\bmt_sft\\fine_tuning\\outputs\\missing_mimic_gt_gemini\\generated_annotations.json",
+  "checkpoint_file": "C:\\Users\\JasonW\\PycharmProjects\\bmt_sft\\fine_tuning\\outputs\\missing_mimic_gt_gemini\\generation_checkpoint.jsonl",
+  "integrated_records": 2,
+  "integrated_fields": 258
+}
