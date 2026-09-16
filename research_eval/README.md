@@ -139,16 +139,21 @@ Full cohort, reviewing complete notes individually, followed by extraction from 
 python research_eval/research_extract.py --models e2b --limit 0 --output_dir research_eval/results/gemma_e2b_per_note
 ```
 
-The Transformers backend imports the existing Gemma loader/generator from
-`prompt_eval/evaluate_gemma4_extraction.py`, so it uses that script's installed
-PyTorch/Transformers/Accelerate environment. Gemma aliases and Hugging Face model
-names are accepted. `--load_in_4bit` is optional. Data preparation and scoring use
-only the Python standard library; no pandas or sklearn installation is required.
+Inference uses the **Transformers** loader and generation functions from
+`prompt_eval/evaluate_gemma4_extraction.py`. Install PyTorch, Transformers, and
+Accelerate in the inference environment; 4-bit loading also needs bitsandbytes,
+and saved LoRA adapters need PEFT. Unsloth is not required for research inference.
+The processor's saved chat template is used; baseline extraction prompts remain
+identical to the SFT template.
+Gemma aliases, Hugging Face model names, and saved fine-tuned adapter directories
+are accepted. `--load_in_4bit` is optional. Data preparation and scoring use only
+the Python standard library.
 
-Optional Ollama backend (requires its Python package and a running local server):
+After training, run the saved adapter directory containing its processor/tokenizer
+files (adjust the path to its actual location):
 
 ```powershell
-python research_eval/research_extract.py --backend ollama --models YOUR_INSTALLED_MODEL --limit 5 --output_dir research_eval/results/ollama
+python research_eval/research_extract.py --models fine_tuning/outputs/gemma4_12b_lora/final --load_in_4bit --limit 5 --output_dir research_eval/results/gemma_finetuned
 ```
 
 Useful options:
@@ -158,8 +163,7 @@ Useful options:
 - `--modes baseline,no_reasoning`: run multiple prompt variants.
   Keep `baseline` alone for the exact SFT prompt. Other modes, including few-shot
   examples, use the shared Gemma evaluation variants without research-specific rewrites.
-  Gemma's Transformers backend also switches internal thinking with the prompt mode;
-  Ollama's internal thinking behavior remains controlled by its model/server defaults.
+  Gemma's internal thinking is switched with the prompt mode, as in the shared evaluator.
 - `--note_strategy per_note`: default; independent complete-note reviews with standard
   evidence quotes, then a final extraction call for each question bundle. Intermediate
   reviews use at most five relevant questions. Arbitrary text splitting is removed.
@@ -168,13 +172,12 @@ Useful options:
   standard `evidence_from_text` output field to select source excerpts.
 - `--parse_retries 1`: retry malformed, incomplete, invalid-valued, or failed responses.
 - `--max_input_tokens 24000`: check every note and final evidence input before generation.
-  Transformers uses the actual chat-template token count and also reserves output
-  space within the model's declared context. Oversized inputs fail visibly without
+  Uses the actual chat-template token count and reserves output space within both
+  the configured sequence cap and the model's declared context. Oversized inputs fail visibly without
   truncation or repeat retries. Use a larger supported context/model for such notes.
-  Ollama lacks a tokenizer endpoint in this wrapper, so it uses a conservative UTF-8
-  byte estimate plus template allowance; this can reject notes that might fit.
-- `--max_new_tokens 8192`: generation allowance. For Ollama, `--ollama-num-ctx`
-  defaults to 65536. The input budget applies to final evidence as well as original notes;
+- `--max_seq_length 32768`: safety cap on total input and output tokens.
+  This does not extend the model's supported context length.
+- `--max_new_tokens 8192`: generation allowance. The input budget applies to final evidence as well as original notes;
   an unusually large evidence collection fails rather than being silently trimmed.
 - `--resume`: rerun the same command with this flag. Complete successful bundles are
   skipped; failed bundles reuse successful note reviews and retry failed work. Changed inputs, question definitions, runtime

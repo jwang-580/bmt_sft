@@ -6,7 +6,8 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from research_eval import research_extract as extraction
 from research_eval.research_common import (RESEARCH_FIELDS, gold_label, load_encounters,
@@ -289,6 +290,65 @@ class ResearchTests(unittest.TestCase):
                                                          "baseline", retries=3)
         self.assertEqual(len(calls), 1)
         self.assertTrue(error)
+
+    def test_reuses_transformers_loader_and_saved_processor(self):
+        from prompt_eval import evaluate_gemma4_extraction as gemma
+        self.assertIs(extraction.load_model, gemma.load_model)
+        torch, model_class, processor_class = Mock(), Mock(), Mock()
+        with patch.object(gemma, "import_transformers_runtime", return_value=(torch, model_class, processor_class)), \
+             patch.object(gemma, "print_model_placement"), patch.dict("sys.modules", {"unsloth": None}):
+            loaded = extraction.load_model("saved_adapter/final", False)
+        processor_class.from_pretrained.assert_called_once_with("saved_adapter/final")
+        model_class.from_pretrained.assert_called_once_with("saved_adapter/final", device_map="auto", dtype="auto")
+        self.assertEqual(loaded, (torch, model_class.from_pretrained.return_value, processor_class.from_pretrained.return_value))
+        model_class.from_pretrained.return_value.eval.assert_called_once_with()
+
+    def test_inference_reserves_output_within_both_context_limits(self):
+        args = SimpleNamespace(load_in_4bit=False, max_seq_length=30, max_input_tokens=50,
+                               max_new_tokens=10, temperature=0.0, top_p=0.95, top_k=64)
+        model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(max_position_embeddings=100)))
+        processor = SimpleNamespace(apply_chat_template=Mock())
+        torch = Mock()
+        torch.cuda.is_available.return_value = False
+        messages = [{"role": "user", "content": "unchanged prompt"}]
+        with patch.object(extraction, "load_model", return_value=(torch, model, processor)) as loader, \
+             patch.object(extraction, "generate", return_value=("answer", "")) as generation:
+            infer, cleanup = extraction.make_infer(args, "adapter")
+            loader.assert_called_once_with("adapter", False)
+            processor.apply_chat_template.return_value = {"input_ids": SimpleNamespace(shape=(1, 21))}
+            with self.assertRaises(extraction.ContextLimitError):
+                infer(messages, "baseline")
+            generation.assert_not_called()
+            processor.apply_chat_template.return_value = {"input_ids": SimpleNamespace(shape=(1, 20))}
+            self.assertEqual(infer(messages, "baseline"), "answer")
+            generation.assert_called_once()
+            self.assertEqual(generation.call_args.args[3], messages)
+            model.config.text_config.max_position_embeddings = 29
+            with self.assertRaises(extraction.ContextLimitError):
+                infer(messages, "baseline")
+            self.assertEqual(generation.call_count, 1)
+            cleanup()
+
+    def test_dry_run_does_not_load_runtime_and_records_transformers(self):
+        output = self.path / "dry"
+        argv = ["research_extract.py", "--data_dir", str(self.path), "--output_dir", str(output),
+                "--models", "saved_adapter/final", "--dry_run"]
+        with patch("sys.argv", argv), patch.object(extraction, "load_model") as loader, \
+             contextlib.redirect_stdout(io.StringIO()):
+            extraction.main()
+        loader.assert_not_called()
+        manifest = json.loads((output / "run_manifest.json").read_text())
+        self.assertEqual(manifest["config"]["runtime"], "transformers")
+        self.assertEqual(manifest["config"]["max_seq_length"], 32768)
+        self.assertEqual(manifest["variants"][0]["model"], "saved_adapter/final")
+
+    def test_cli_rejects_removed_backend_and_invalid_context(self):
+        for flags in (["--backend", "ollama"], ["--ollama-num-ctx", "65536"],
+                      ["--max_seq_length", "8192"]):
+            with self.subTest(flags=flags), patch("sys.argv", ["research_extract.py", *flags]), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                extraction.main()
+            self.assertEqual(raised.exception.code, 2)
 
     def test_per_note_default_cli_checkpoint_and_resume(self):
         output = self.path / "note_out"

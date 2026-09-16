@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Extract all research questions in bundles of five with question-specific notes.
 
-Uses the same Gemma loader/generator and record format as evaluate_gemma4_extraction.py.
+Uses the Gemma evaluator's Transformers loader, generation, and record format.
 python research_eval/research_extract.py --dry_run --limit 0
 python research_eval/research_extract.py --models e2b --limit 5
-python research_eval/research_extract.py --backend ollama --models gemma4 --limit 5
 """
 from __future__ import annotations
 
@@ -22,7 +21,8 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from prompt_eval.evaluate_gemma4_extraction import generate, load_model, resolve_models, format_messages_for_processor
+from prompt_eval.evaluate_gemma4_extraction import (generate, load_model, resolve_models,
+    format_messages_for_processor)
 from prompt_eval.extraction_prompts import (DEFAULT_MODES, EXTRACTION_SYSTEM_PROMPT,
     build_user_prompt, mode_settings)
 from research_eval.research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, ROOT,
@@ -38,13 +38,12 @@ class ContextLimitError(ValueError):
     """The complete input cannot fit; never truncate or retry the same oversized input."""
 
 
-def check_context_budget(input_tokens, max_input_tokens, max_new_tokens, context_window=None, *, estimated=False):
+def check_context_budget(input_tokens, max_input_tokens, max_new_tokens, context_window=None):
     budget = max_input_tokens
     if context_window:
         budget = min(budget, context_window - max_new_tokens)
     if input_tokens > budget:
-        measurement = "conservative token estimate" if estimated else "token count"
-        raise ContextLimitError(f"Complete input {measurement} is {input_tokens}; input budget is {budget}. "
+        raise ContextLimitError(f"Complete input token count is {input_tokens}; input budget is {budget}. "
                                 "Use a larger supported context/model. No note text was truncated.")
 
 
@@ -228,28 +227,14 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
 
 
 def make_infer(args, model_name):
-    if args.backend == "ollama":
-        try:
-            from ollama import chat
-        except ImportError as exc:
-            raise RuntimeError("Ollama backend requires the ollama Python package") from exc
-        def infer(messages, mode):
-            # Ollama exposes no tokenizer here. Use a conservative byte-based upper
-            # estimate, with space for its chat template, rather than risk truncation.
-            estimate = sum(len(m["content"].encode("utf-8")) for m in messages) + 4096
-            check_context_budget(estimate, args.max_input_tokens, args.max_new_tokens, args.ollama_num_ctx, estimated=True)
-            response = chat(model=model_name, messages=messages,
-                            options=dict(temperature=args.temperature, num_predict=args.max_new_tokens,
-                                         num_ctx=args.ollama_num_ctx))
-            return response.message.content
-        return infer, lambda: None
     torch, model, processor = load_model(model_name, args.load_in_4bit)
     def infer(messages, mode):
         encoded = processor.apply_chat_template(format_messages_for_processor(messages, processor),
             tokenize=True, return_dict=True, return_tensors="pt", add_generation_prompt=True,
             enable_thinking=mode_settings(mode)["thinking"])
         text_config = getattr(model.config, "text_config", model.config)
-        context_window = getattr(text_config, "max_position_embeddings", None)
+        context_window = min(args.max_seq_length,
+                             getattr(text_config, "max_position_embeddings", None) or args.max_seq_length)
         check_context_budget(encoded["input_ids"].shape[-1], args.max_input_tokens,
                              args.max_new_tokens, context_window)
         del encoded
@@ -272,21 +257,21 @@ def main():
     parser.add_argument("--ground-truth", "--ground_truth")
     parser.add_argument("--questions", default=str(DEFAULT_QUESTIONS))
     parser.add_argument("--output-dir", "--output_dir", default=str(Path(__file__).parent / "results"))
-    parser.add_argument("--backend", choices=["transformers", "ollama"], default="transformers")
-    parser.add_argument("--models", default="e2b")
+    parser.add_argument("--models", default="e2b", help="Gemma aliases, Hugging Face IDs, or saved adapter directories (comma-separated)")
     parser.add_argument("--modes", default="baseline")
     parser.add_argument("--fields-per-call", "--fields_per_call", type=int, default=5)
     parser.add_argument("--limit", type=int, default=5, help="Encounter limit; 0 means all cohort encounters")
     parser.add_argument("--note-strategy", "--note_strategy", choices=["per_note", "full"], default="per_note")
     parser.add_argument("--max-input-tokens", "--max_input_tokens", type=int, default=24000,
-                        help="Input budget before inference; exact tokenizer count for Transformers, conservative byte estimate for Ollama")
+                        help="Input budget before inference, measured with the model's chat template and tokenizer")
+    parser.add_argument("--max-seq-length", "--max_seq_length", type=int, default=32768,
+                        help="Safety cap on input plus output tokens; does not extend the model's context")
     parser.add_argument("--max-new-tokens", "--max_new_tokens", type=int, default=8192)
     parser.add_argument("--parse-retries", "--parse_retries", type=int, default=1)
     parser.add_argument("--load-in-4bit", "--load_in_4bit", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", "--top_p", type=float, default=0.95)
     parser.add_argument("--top-k", "--top_k", type=int, default=64)
-    parser.add_argument("--ollama-num-ctx", type=int, default=65536)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--save-raw-runs", "--save_raw_runs", action="store_true")
     parser.add_argument("--dry-run", "--dry_run", action="store_true")
@@ -300,8 +285,8 @@ def main():
         parser.error("per_note requires evidence_from_text; use baseline for SFT alignment or explicitly select full for modes without evidence")
     if args.limit < 0 or args.fields_per_call <= 0 or args.parse_retries < 0 or args.max_new_tokens <= 0:
         parser.error("Invalid limit, bundle size, retry count, or generation length")
-    if args.max_input_tokens <= 0 or args.ollama_num_ctx <= args.max_new_tokens:
-        parser.error("Require positive max_input_tokens and ollama_num_ctx > max_new_tokens")
+    if args.max_input_tokens <= 0 or args.max_seq_length <= args.max_new_tokens:
+        parser.error("Require positive max_input_tokens and max_seq_length > max_new_tokens")
     data_dir = Path(args.data_dir)
     cohort_path = Path(args.cohort or data_dir / "target_filtered.csv")
     gt_path = Path(args.ground_truth or data_dir / "toci_ptcy_crs.csv")
@@ -311,7 +296,7 @@ def main():
     encounters = all_encounters[:args.limit] if args.limit else all_encounters
     if not encounters:
         parser.error("No cohort encounters selected")
-    models = resolve_models(args.models) if args.backend == "transformers" else [m.strip() for m in args.models.split(",") if m.strip()]
+    models = resolve_models(args.models)
     if not models or len(models) != len(set(models)):
         parser.error("--models must contain unique model names")
     batches = bundles(list(questions), args.fields_per_call)
@@ -323,6 +308,7 @@ def main():
             Path(__file__).with_name("research_eval.py"), ROOT / "prompt_eval/extraction_prompts.py",
             ROOT / "prompt_eval/evaluate_gemma4_extraction.py"]
     config = {k: v for k, v in vars(args).items() if k not in {"resume", "dry_run", "output_dir", "save_raw_runs", "save_prompt_preview"}}
+    config["runtime"] = "transformers"
     signature = dict(config=config, input_hashes={str(p.resolve()): file_hash(p) for p in inputs},
                      code_hashes={str(p.resolve()): file_hash(p) for p in code})
     fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
