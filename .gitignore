@@ -9,3 +9,4 @@ prompt_eval/results/
 outputs/*
 unsloth_compiled_cache/*
 wandb/*
+fine_tuning/outputs
