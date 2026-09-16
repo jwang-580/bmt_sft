@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BMT Evaluation Results Explorer</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f7fb;
+      --surface: #ffffff;
+      --surface-2: #eef2f7;
+      --text: #18202b;
+      --muted: #657184;
+      --border: #d9e0e9;
+      --accent: #2563eb;
+      --accent-soft: #dbeafe;
+      --good: #16803c;
+      --bad: #c43131;
+      --warn: #a15c00;
+      --shadow: 0 12px 36px rgba(28, 39, 54, .08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10141b;
+        --surface: #171d26;
+        --surface-2: #202936;
+        --text: #eef3fa;
+        --muted: #a5b0c0;
+        --border: #303b4b;
+        --accent: #75a7ff;
+        --accent-soft: #1e3a68;
+        --good: #63d58a;
+        --bad: #ff8585;
+        --warn: #f4bc64;
+        --shadow: 0 12px 36px rgba(0, 0, 0, .24);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button, input, select { font: inherit; }
+    button, input[type="file"], select, input[type="search"] { color: var(--text); }
+    .shell { max-width: 1500px; margin: 0 auto; padding: 28px; }
+    header { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; margin-bottom: 20px; }
+    h1 { margin: 0 0 5px; font-size: clamp(24px, 3vw, 36px); letter-spacing: -.035em; line-height: 1.1; }
+    h2 { margin: 0; font-size: 17px; }
+    p { margin: 0; }
+    .muted { color: var(--muted); }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+    }
+    .import-panel { padding: 20px; margin-bottom: 18px; }
+    .dropzone {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 18px;
+      border: 1.5px dashed var(--border);
+      border-radius: 10px;
+      background: var(--surface-2);
+      transition: border-color .15s, background .15s;
+    }
+    .dropzone.drag { border-color: var(--accent); background: var(--accent-soft); }
+    .dropzone strong { display: block; margin-bottom: 3px; }
+    input[type="file"] { max-width: 330px; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .button {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: var(--surface);
+      cursor: pointer;
+    }
+    .button:hover { border-color: var(--accent); }
+    .button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .status { margin-top: 12px; min-height: 20px; color: var(--muted); }
+    .status.error { color: var(--bad); }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .stat { padding: 16px 18px; }
+    .stat .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .stat .value { margin-top: 3px; font-size: 26px; font-weight: 650; letter-spacing: -.03em; }
+    .filters { padding: 15px; margin-bottom: 18px; display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 10px; }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    select, input[type="search"] {
+      width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--border);
+      border-radius: 7px; background: var(--surface); font-size: 13px;
+    }
+    .section { margin-bottom: 18px; }
+    .section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin: 0 2px 10px; }
+    .chart { padding: 16px; display: grid; gap: 9px; }
+    .bar-row { display: grid; grid-template-columns: minmax(210px, 35%) 1fr 58px; gap: 10px; align-items: center; }
+    .bar-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+    .track { height: 15px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+    .fill { height: 100%; background: var(--accent); border-radius: inherit; min-width: 1px; }
+    .bar-value { text-align: right; font-variant-numeric: tabular-nums; }
+    .table-wrap { overflow: auto; max-height: 560px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { position: sticky; top: 0; z-index: 1; background: var(--surface-2); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .045em; white-space: nowrap; }
+    th button { all: unset; cursor: pointer; }
+    td.number { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    td.answer { min-width: 180px; max-width: 340px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    td.detail { min-width: 240px; max-width: 440px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    .empty { padding: 30px; text-align: center; color: var(--muted); }
+    .hidden { display: none !important; }
+    .file-list { margin-top: 10px; color: var(--muted); font-size: 12px; max-height: 90px; overflow: auto; }
+    .file-list span { display: inline-block; margin: 2px 6px 2px 0; padding: 2px 7px; border-radius: 999px; background: var(--surface-2); }
+    @media (max-width: 950px) {
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      .filters { grid-template-columns: repeat(3, 1fr); }
+    }
+    @media (max-width: 620px) {
+      .shell { padding: 16px; }
+      header, .dropzone { grid-template-columns: 1fr; display: grid; }
+      .stats { grid-template-columns: 1fr 1fr; }
+      .filters { grid-template-columns: 1fr 1fr; }
+      .bar-row { grid-template-columns: 135px 1fr 48px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>BMT evaluation explorer</h1>
+        <p class="muted">Compare runs, inspect extracted answers, and recompute accuracy locally.</p>
+      </div>
+      <button id="clearButton" class="button" type="button">Clear data</button>
+    </header>
+
+    <section class="panel import-panel" aria-labelledby="importTitle">
+      <div id="dropzone" class="dropzone">
+        <div>
+          <strong id="importTitle">Import evaluation files</strong>
+          <span class="muted">Predictions JSON, raw-runs JSONL, metrics CSV/JSON, MIMIC or OSU GT JSON, and evaluation ID lists are supported. Files never leave your browser.</span>
+        </div>
+        <input id="fileInput" type="file" multiple accept=".json,.jsonl,.csv">
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite">Choose one or more files, or drag a folder selection here.</div>
+      <div id="fileList" class="file-list"></div>
+    </section>
+
+    <div id="dashboard" class="hidden">
+      <section class="stats" aria-label="Summary">
+        <div class="panel stat"><div class="label">Imported files</div><div id="statFiles" class="value">0</div></div>
+        <div class="panel stat"><div class="label">Prediction rows</div><div id="statPredictions" class="value">0</div></div>
+        <div class="panel stat"><div class="label">Visible runs</div><div id="statRuns" class="value">0</div></div>
+        <div class="panel stat"><div class="label">Best exact accuracy</div><div id="statAccuracy" class="value">—</div></div>
+      </section>
+
+      <section class="panel filters" aria-label="Filters">
+        <label>Dataset<select id="datasetFilter"><option value="">All</option></select></label>
+        <label>Model<select id="modelFilter"><option value="">All</option></select></label>
+        <label>Mode<select id="modeFilter"><option value="">All</option></select></label>
+        <label>Fields/call<select id="fpcFilter"><option value="">All</option></select></label>
+        <label>Strategy<select id="strategyFilter"><option value="">All</option></select></label>
+        <label>Find answer<input id="searchFilter" type="search" placeholder="Record, field, answer…"></label>
+      </section>
+
+      <section class="section" aria-labelledby="chartTitle">
+        <div class="section-head"><h2 id="chartTitle">Exact accuracy by run</h2><span id="chartCaption" class="muted"></span></div>
+        <div id="chart" class="panel chart"></div>
+      </section>
+
+      <section class="section" aria-labelledby="runsTitle">
+        <div class="section-head">
+          <h2 id="runsTitle">Runs</h2>
+          <div class="toolbar"><span id="runsCount" class="muted"></span><button id="exportButton" class="button" type="button">Export visible CSV</button></div>
+        </div>
+        <div class="panel table-wrap">
+          <table id="runsTable">
+            <thead><tr>
+              <th><button data-sort="dataset">Dataset</button></th><th><button data-sort="model">Model</button></th>
+              <th><button data-sort="mode">Mode</button></th><th><button data-sort="fields_per_call">FPC</button></th>
+              <th><button data-sort="note_strategy">Strategy</button></th><th><button data-sort="exact_accuracy">Exact</button></th>
+              <th><button data-sort="strict_exact_accuracy">Strict</button></th><th><button data-sort="coverage">Coverage</button></th>
+              <th><button data-sort="parse_errors">Parse errors</button></th><th><button data-sort="prediction_rows">Rows</button></th>
+              <th>Source</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="answersTitle">
+        <div class="section-head"><h2 id="answersTitle">Answers</h2><span id="answersCount" class="muted"></span></div>
+        <div class="panel table-wrap">
+          <table id="answersTable">
+            <thead><tr><th>Dataset</th><th>Model / mode</th><th>Record</th><th>Field</th><th>Answer</th><th>Evidence</th><th>Rationale / parse error</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+      const defaultMimicCohort = [
+        "20056386", "21334581", "21709148", "21951412", "23243823", "24341563", "24543622", "24801854", "24829092", "24914573",
+        "25009858", "25904914", "25926571", "26181264", "26419924", "26612662", "26612663", "26612664", "27683739", "29595871"
+      ];
+      const state = {
+        files: new Set(), predictions: [], importedMetrics: [], gold: { mimic: new Map(), osu: new Map() },
+        cohort: { mimic: new Set(defaultMimicCohort), osu: new Set() }, sort: { key: "exact_accuracy", dir: -1 }
+      };
+      const groupFields = ["dataset", "model", "mode", "fields_per_call", "note_strategy"];
+      const emptyAnswers = new Set(["", "N/A", "NA", "NONE", "NULL", "NOT FOUND", "UNKNOWN"]);
+      const $ = id => document.getElementById(id);
+      const els = {
+        input: $("fileInput"), drop: $("dropzone"), status: $("status"), files: $("fileList"), dashboard: $("dashboard"),
+        dataset: $("datasetFilter"), model: $("modelFilter"), mode: $("modeFilter"), fpc: $("fpcFilter"), strategy: $("strategyFilter"), search: $("searchFilter"),
+        chart: $("chart"), chartCaption: $("chartCaption"), runsBody: $("runsTable").tBodies[0], answersBody: $("answersTable").tBodies[0]
+      };
+
+      function parseCsv(text) {
+        const rows = []; let row = [], cell = "", quoted = false;
+        for (let i = 0; i < text.length; i++) {
+          const c = text[i], next = text[i + 1];
+          if (quoted && c === '"' && next === '"') { cell += '"'; i++; }
+          else if (c === '"') quoted = !quoted;
+          else if (c === ',' && !quoted) { row.push(cell); cell = ""; }
+          else if ((c === '\n' || c === '\r') && !quoted) {
+            if (c === '\r' && next === '\n') i++;
+            row.push(cell); if (row.some(v => v !== "")) rows.push(row); row = []; cell = "";
+          } else cell += c;
+        }
+        if (cell || row.length) { row.push(cell); rows.push(row); }
+        if (!rows.length) return [];
+        const headers = rows.shift().map(h => h.trim());
+        return rows.map(values => Object.fromEntries(headers.map((h, i) => [h, values[i] ?? ""])));
+      }
+
+      function normalizeQuestion(value) { return String(value ?? "").trim().replace(/^(?:Question|Field)\s+/i, ""); }
+      function isEmpty(value) {
+        if (value == null) return true;
+        if (Array.isArray(value)) return !value.length || value.every(isEmpty);
+        if (typeof value === "object") return !Object.keys(value).length;
+        return emptyAnswers.has(String(value).trim().toUpperCase());
+      }
+      function normalizeAnswer(value) {
+        if (value == null) return "";
+        if (Array.isArray(value)) return value.map(normalizeAnswer).filter(Boolean).sort().join("|");
+        if (typeof value === "object") return JSON.stringify(value, Object.keys(value).sort());
+        return String(value).trim().toLowerCase().replace(/\s+/g, " ").replace(/[–—]/g, "-")
+          .replace(/\s*(?:-\s*)?go to (?:question|field)\s+[a-z]*\d+[a-z]*\s*\.?\s*$/i, "").trim();
+      }
+      function answersMatch(fieldId, predicted, gold) {
+        if (normalizeQuestion(fieldId) === "31") {
+          const p = isEmpty(predicted) || normalizeAnswer(predicted) === "1";
+          const g = isEmpty(gold) || normalizeAnswer(gold) === "1";
+          if (p && g) return true;
+        }
+        return (isEmpty(predicted) && isEmpty(gold)) || normalizeAnswer(predicted) === normalizeAnswer(gold);
+      }
+      function asNumber(value) {
+        if (value === null || value === undefined || value === "") return null;
+        const number = Number(value); return Number.isFinite(number) ? number : null;
+      }
+      function basename(path) { return String(path || "").split(/[\\/]/).pop(); }
+      function inferDataset(row, filename) {
+        const declared = String(row.dataset || "").toLowerCase();
+        if (declared === "mimic" || declared === "osu") return declared;
+        const lower = filename.toLowerCase();
+        if (lower.startsWith("mimic_") || row.hadm_id != null || String(row.record_id_type || "").toLowerCase() === "hadm_id") return "mimic";
+        if (lower.startsWith("osu_") || row.MRN != null || String(row.record_id_type || "").toLowerCase() === "mrn") return "osu";
+        return "unknown";
+      }
+
+      function flattenPredictions(value, filename, inherited = {}) {
+        if (Array.isArray(value)) return value.flatMap(item => flattenPredictions(item, filename, inherited));
+        if (!value || typeof value !== "object") return [];
+        const context = { ...inherited };
+        groupFields.forEach(k => { if (value[k] !== undefined) context[k] = value[k]; });
+        for (const wrapper of ["predictions", "results", "records", "extractions"]) {
+          if (Array.isArray(value[wrapper])) return flattenPredictions(value[wrapper], filename, context);
+        }
+        const recordId = value.record_id ?? value.hadm_id ?? value.MRN;
+        if (recordId == null || value.field_id == null || value.answers === undefined) return [];
+        const row = { ...context, ...value, record_id: String(recordId).trim(), field_id: normalizeQuestion(value.field_id), source_file: filename };
+        row.dataset = inferDataset(row, filename);
+        row.fields_per_call = asNumber(row.fields_per_call);
+        return [row];
+      }
+
+      function tryLoadGold(value, filename) {
+        if (!Array.isArray(value) || !value.length) return false;
+        const looksLikePredictions = value.some(row => row && (row.model || row.mode || row.dataset));
+        if (looksLikePredictions) return false;
+        let loaded = 0;
+        for (const row of value) {
+          if (!row || typeof row !== "object") continue;
+          const dataset = inferDataset(row, filename);
+          const recordId = row.hadm_id ?? row.MRN ?? row.record_id;
+          if (recordId == null || dataset === "unknown") continue;
+          if (row.answers && !Array.isArray(row.answers) && typeof row.answers === "object" && row.field_id == null) {
+            for (const [fieldId, answer] of Object.entries(row.answers)) {
+              state.gold[dataset].set(`${String(recordId).trim()}|${normalizeQuestion(fieldId)}`, answer); loaded++;
+            }
+          } else if (row.field_id != null && row.answers !== undefined) {
+            state.gold[dataset].set(`${String(recordId).trim()}|${normalizeQuestion(row.field_id)}`, row.answers); loaded++;
+          }
+        }
+        return loaded > 0;
+      }
+
+      function tryLoadCohort(value, filename) {
+        if (!Array.isArray(value) || !value.length || !value.every(item => ["string", "number"].includes(typeof item))) return false;
+        const lower = filename.toLowerCase();
+        const dataset = lower.includes("mimic") ? "mimic" : lower.includes("osu") ? "osu" : "";
+        if (!dataset) return false;
+        state.cohort[dataset] = new Set(value.map(item => String(item).trim()).filter(Boolean));
+        return true;
+      }
+
+      function normalizeMetric(row, filename, inherited = {}) {
+        const merged = { ...inherited, ...row };
+        const dataset = inferDataset(merged, filename);
+        const exact = asNumber(merged.exact_accuracy ?? merged.exact);
+        const strict = asNumber(merged.strict_exact_accuracy);
+        const coverage = asNumber(merged.coverage);
+        return {
+          dataset, model: merged.model || "", mode: merged.mode || "", fields_per_call: asNumber(merged.fields_per_call),
+          note_strategy: merged.note_strategy || "full", exact_accuracy: exact, strict_exact_accuracy: strict,
+          coverage, empty_nonempty_accuracy: asNumber(merged.empty_nonempty_accuracy), parse_errors: asNumber(merged.parse_errors) ?? 0,
+          prediction_rows: asNumber(merged.prediction_rows ?? merged.n ?? merged.gold_covered) ?? 0,
+          correct: asNumber(merged.correct), source_file: basename(merged.predictions_file) || filename, metric_source: filename
+        };
+      }
+
+      function loadMetrics(value, filename) {
+        if (value && !Array.isArray(value) && Array.isArray(value.groups)) {
+          const inherited = { dataset: value.dataset, predictions_file: value.predictions_file };
+          state.importedMetrics.push(...value.groups.map(row => normalizeMetric(row, filename, inherited)));
+          return true;
+        }
+        if (Array.isArray(value) && value.length && value.some(row => row && (row.exact !== undefined || row.exact_accuracy !== undefined))) {
+          state.importedMetrics.push(...value.map(row => normalizeMetric(row, filename)));
+          return true;
+        }
+        return false;
+      }
+
+      async function loadFile(file) {
+        const text = await file.text();
+        let value;
+        if (file.name.toLowerCase().endsWith(".csv")) value = parseCsv(text);
+        else if (file.name.toLowerCase().endsWith(".jsonl")) value = text.split(/\r?\n/).filter(Boolean).map((line, i) => {
+          try { return JSON.parse(line); } catch (error) { throw new Error(`${file.name}, line ${i + 1}: ${error.message}`); }
+        });
+        else value = JSON.parse(text);
+        if (!loadMetrics(value, file.name) && !tryLoadCohort(value, file.name) && !tryLoadGold(value, file.name)) {
+          const rows = flattenPredictions(value, file.name);
+          if (!rows.length) throw new Error(`${file.name}: no predictions, metrics, or GT answers recognized`);
+          state.predictions.push(...rows);
+        }
+        state.files.add(file.name);
+      }
+
+      function runSignature(row, includeSource = true) {
+        const parts = groupFields.map(k => String(row[k] ?? ""));
+        if (includeSource) parts.push(String(row.source_file || ""));
+        return parts.join("\u001f");
+      }
+      function computedRuns() {
+        const groups = new Map();
+        for (const row of state.predictions) {
+          const key = runSignature(row);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(row);
+        }
+        return [...groups.values()].map(rows => {
+          const first = rows[0], unique = new Map(); let duplicates = 0;
+          for (const row of rows) {
+            const key = `${row.record_id}|${row.field_id}`;
+            if (unique.has(key)) duplicates++;
+            unique.set(key, row);
+          }
+          const gold = state.gold[first.dataset] || new Map();
+          let covered = 0, correct = 0, emptyCorrect = 0, parseErrors = 0;
+          const recordIds = new Set(), fieldIds = new Set();
+          for (const row of unique.values()) {
+            recordIds.add(row.record_id); fieldIds.add(row.field_id);
+            if (row.parse_error) parseErrors++;
+            const key = `${row.record_id}|${row.field_id}`;
+            if (!gold.has(key)) continue;
+            covered++; const goldAnswer = gold.get(key);
+            const exact = answersMatch(row.field_id, row.answers, goldAnswer);
+            if (exact) correct++;
+            if (exact || isEmpty(row.answers) === isEmpty(goldAnswer)) emptyCorrect++;
+          }
+          let expected = 0;
+          const cohort = state.cohort[first.dataset];
+          const recordScope = cohort && cohort.size ? cohort : recordIds;
+          if (gold.size) for (const key of gold.keys()) if (recordScope.has(key.split("|")[0])) expected++;
+          return {
+            dataset: first.dataset, model: first.model || "", mode: first.mode || "", fields_per_call: first.fields_per_call,
+            note_strategy: first.note_strategy || "full", source_file: first.source_file, prediction_rows: rows.length,
+            duplicate_prediction_keys: duplicates, parse_errors: parseErrors, gold_covered: covered,
+            exact_accuracy: covered ? correct / covered : null, strict_exact_accuracy: expected ? correct / expected : null,
+            coverage: expected ? covered / expected : null, empty_nonempty_accuracy: covered ? emptyCorrect / covered : null,
+            correct, expected_gold_cells: expected, computed_in_browser: true
+          };
+        });
+      }
+
+      function allRuns() {
+        const computed = computedRuns();
+        const used = new Set(computed.map(row => runSignature(row)));
+        return computed.concat(state.importedMetrics.filter(row => !used.has(runSignature(row))));
+      }
+      function values(rows, key) { return [...new Set(rows.map(r => String(r[key] ?? "")).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })); }
+      function setOptions(select, options) {
+        const current = select.value;
+        select.innerHTML = '<option value="">All</option>' + options.map(v => `<option>${escapeHtml(v)}</option>`).join("");
+        if (options.includes(current)) select.value = current;
+      }
+      function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+      function formatPct(value) { return value == null || !Number.isFinite(Number(value)) ? "—" : `${(Number(value) * 100).toFixed(1)}%`; }
+      function formatInt(value) { return value == null || value === "" ? "—" : Number(value).toLocaleString(); }
+      function answerText(value) { return typeof value === "string" ? value : JSON.stringify(value); }
+      function selected(row) {
+        return (!els.dataset.value || row.dataset === els.dataset.value) && (!els.model.value || row.model === els.model.value)
+          && (!els.mode.value || row.mode === els.mode.value) && (!els.fpc.value || String(row.fields_per_call ?? "") === els.fpc.value)
+          && (!els.strategy.value || row.note_strategy === els.strategy.value);
+      }
+      function filteredRuns() { return allRuns().filter(selected); }
+      function filteredPredictions() {
+        const query = els.search.value.trim().toLowerCase();
+        return state.predictions.filter(row => selected(row) && (!query || [row.record_id, row.field_id, row.field_name, answerText(row.answers), row.evidence_from_text, row.reasoning_trace].some(v => String(v ?? "").toLowerCase().includes(query))));
+      }
+
+      function renderChart(runs) {
+        const scored = runs.filter(r => r.exact_accuracy != null).sort((a, b) => b.exact_accuracy - a.exact_accuracy).slice(0, 20);
+        els.chartCaption.textContent = scored.length ? `Top ${scored.length} visible scored runs` : "Import GT or metrics to calculate accuracy";
+        els.chart.innerHTML = scored.length ? scored.map(row => {
+          const label = `${row.model || "unnamed"} · ${row.mode || "run"} · fpc ${row.fields_per_call ?? "—"} · ${row.note_strategy || "full"}`;
+          return `<div class="bar-row"><div class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</div><div class="track"><div class="fill" style="width:${Math.max(0, Math.min(100, row.exact_accuracy * 100))}%"></div></div><div class="bar-value">${formatPct(row.exact_accuracy)}</div></div>`;
+        }).join("") : '<div class="empty">No scored runs match the filters.</div>';
+      }
+
+      function renderRuns(runs) {
+        const { key, dir } = state.sort;
+        runs.sort((a, b) => {
+          const av = a[key], bv = b[key];
+          if (av == null) return 1; if (bv == null) return -1;
+          return (typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv), undefined, { numeric: true })) * dir;
+        });
+        $("runsCount").textContent = `${runs.length.toLocaleString()} run${runs.length === 1 ? "" : "s"}`;
+        els.runsBody.innerHTML = runs.length ? runs.map(row => `<tr>
+          <td>${escapeHtml(row.dataset)}</td><td>${escapeHtml(row.model || "—")}</td><td>${escapeHtml(row.mode || "—")}</td>
+          <td class="number">${escapeHtml(row.fields_per_call ?? "—")}</td><td>${escapeHtml(row.note_strategy || "—")}</td>
+          <td class="number ${row.exact_accuracy >= .9 ? "good" : ""}">${formatPct(row.exact_accuracy)}</td>
+          <td class="number">${formatPct(row.strict_exact_accuracy)}</td><td class="number">${formatPct(row.coverage)}</td>
+          <td class="number ${row.parse_errors ? "bad" : ""}">${formatInt(row.parse_errors)}</td><td class="number">${formatInt(row.prediction_rows)}</td>
+          <td>${escapeHtml(row.source_file || row.metric_source || "—")}</td></tr>`).join("") : '<tr><td colspan="11" class="empty">No runs match the filters.</td></tr>';
+      }
+
+      function renderAnswers(rows) {
+        const limit = 500, shown = rows.slice(0, limit);
+        $("answersCount").textContent = `${rows.length.toLocaleString()} matching row${rows.length === 1 ? "" : "s"}${rows.length > limit ? ` · showing first ${limit}` : ""}`;
+        els.answersBody.innerHTML = shown.length ? shown.map(row => {
+          const tail = row.parse_error ? `Parse error: ${row.parse_error}` : row.reasoning_trace || "";
+          return `<tr><td>${escapeHtml(row.dataset)}</td><td>${escapeHtml(`${row.model || "—"} / ${row.mode || "—"}`)}</td><td>${escapeHtml(row.record_id)}</td>
+            <td>${escapeHtml(row.field_id)}<div class="muted">${escapeHtml(row.field_name || "")}</div></td><td class="answer">${escapeHtml(answerText(row.answers))}</td>
+            <td class="detail">${escapeHtml(row.evidence_from_text || "")}</td><td class="detail ${row.parse_error ? "bad" : ""}">${escapeHtml(tail)}</td></tr>`;
+        }).join("") : '<tr><td colspan="7" class="empty">No answer rows match the filters.</td></tr>';
+      }
+
+      function render() {
+        const runs = allRuns();
+        els.dashboard.classList.toggle("hidden", !state.files.size);
+        setOptions(els.dataset, values(runs.concat(state.predictions), "dataset"));
+        setOptions(els.model, values(runs.concat(state.predictions), "model"));
+        setOptions(els.mode, values(runs.concat(state.predictions), "mode"));
+        setOptions(els.fpc, values(runs.concat(state.predictions), "fields_per_call"));
+        setOptions(els.strategy, values(runs.concat(state.predictions), "note_strategy"));
+        const visibleRuns = filteredRuns(), answers = filteredPredictions();
+        $("statFiles").textContent = state.files.size.toLocaleString();
+        $("statPredictions").textContent = state.predictions.length.toLocaleString();
+        $("statRuns").textContent = visibleRuns.length.toLocaleString();
+        const accuracies = visibleRuns.map(r => r.exact_accuracy).filter(v => v != null);
+        $("statAccuracy").textContent = accuracies.length ? formatPct(Math.max(...accuracies)) : "—";
+        els.files.innerHTML = [...state.files].map(name => `<span>${escapeHtml(name)}</span>`).join("");
+        renderChart([...visibleRuns]); renderRuns(visibleRuns); renderAnswers(answers);
+      }
+
+      async function importFiles(files) {
+        if (!files.length) return;
+        els.status.className = "status"; els.status.textContent = `Importing ${files.length} file${files.length === 1 ? "" : "s"}…`;
+        const failures = [];
+        for (const file of files) {
+          try { await loadFile(file); } catch (error) { failures.push(error.message); }
+        }
+        if (failures.length) { els.status.className = "status error"; els.status.textContent = failures.join(" · "); }
+        else els.status.textContent = `Loaded ${state.files.size} file${state.files.size === 1 ? "" : "s"}. ${state.gold.mimic.size + state.gold.osu.size ? "GT detected; accuracy recomputed in browser." : "Import a GT or metrics file to see accuracy."}`;
+        render();
+      }
+
+      function csvEscape(value) { const text = String(value ?? ""); return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; }
+      function exportRuns() {
+        const rows = filteredRuns(); if (!rows.length) return;
+        const fields = ["dataset", "model", "mode", "fields_per_call", "note_strategy", "exact_accuracy", "strict_exact_accuracy", "coverage", "empty_nonempty_accuracy", "parse_errors", "prediction_rows", "source_file"];
+        const csv = [fields.join(","), ...rows.map(row => fields.map(field => csvEscape(row[field])).join(","))].join("\n");
+        const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+        const link = document.createElement("a"); link.href = url; link.download = "visible_evaluation_runs.csv"; link.click(); URL.revokeObjectURL(url);
+      }
+
+      els.input.addEventListener("change", event => importFiles([...event.target.files]));
+      ["dragenter", "dragover"].forEach(type => els.drop.addEventListener(type, event => { event.preventDefault(); els.drop.classList.add("drag"); }));
+      ["dragleave", "drop"].forEach(type => els.drop.addEventListener(type, event => { event.preventDefault(); els.drop.classList.remove("drag"); }));
+      els.drop.addEventListener("drop", event => importFiles([...event.dataTransfer.files]));
+      [els.dataset, els.model, els.mode, els.fpc, els.strategy].forEach(control => control.addEventListener("change", render));
+      els.search.addEventListener("input", render);
+      $("clearButton").addEventListener("click", () => { state.files.clear(); state.predictions = []; state.importedMetrics = []; state.gold.mimic.clear(); state.gold.osu.clear(); state.cohort.mimic = new Set(defaultMimicCohort); state.cohort.osu.clear(); els.input.value = ""; els.status.className = "status"; els.status.textContent = "Choose one or more files, or drag a folder selection here."; render(); });
+      $("exportButton").addEventListener("click", exportRuns);
+      document.querySelectorAll("[data-sort]").forEach(button => button.addEventListener("click", () => { const key = button.dataset.sort; state.sort.dir = state.sort.key === key ? -state.sort.dir : (key.includes("accuracy") || key === "coverage" ? -1 : 1); state.sort.key = key; render(); }));
+    })();
+  </script>
+</body>
+</html>

@@ -328,7 +328,7 @@ def load_notes(dataset, mimic_path, osu_path, limit):
 def load_gold_answers(path):
     if not path or not os.path.exists(path):
         return {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         records = json.load(f)
 
     gold = {}
