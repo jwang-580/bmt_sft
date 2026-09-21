@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from research_eval import research_extract as extraction
-from research_eval.research_common import (RESEARCH_FIELDS, gold_label, load_encounters,
+from research_eval.research_common import (RESEARCH_FIELDS, data_audit, gold_label, load_encounters,
     load_ground_truth, load_questions, normalize_value, progress_date, record_id,
     unique_encounters, write_csv)
 from research_eval.research_eval import evaluate_file, load_predictions, score_variant
@@ -181,8 +181,8 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(rows[0]["answers"], "1")
         self.assertIn("Tocilizumab given once", prompts[-1])
         self.assertIn("Source: discharge", prompts[-1])
-        self.assertNotIn("FIRST_ADMISSION_PROGRESS", prompts[-1])
-        self.assertNotIn("FIRST_DISCHARGE", prompts[-1])
+        self.assertIn("FIRST_ADMISSION_PROGRESS", prompts[-1])  # Neighboring source context.
+        self.assertIn("FIRST_DISCHARGE", prompts[-1])
         self.assertEqual(len(prompts), 3)  # One progress note, one discharge, one synthesis.
         self.assertNotIn('"answers":', prompts[-1])
         self.assertNotIn("MODEL_RATIONALE_SENTINEL", prompts[-1])
@@ -375,7 +375,7 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(len(saved), 7)
         manifest = json.loads((output / "run_manifest.json").read_text())
         self.assertEqual(manifest["variants"][0]["note_strategy"], "per_note")
-        self.assertEqual(manifest["prompt_contract"], "research_question_instructions_v2")
+        self.assertEqual(manifest["prompt_contract"], "research_question_instructions_v3")
         self.assertTrue(all("events" not in field for v in saved.values() for field in v["fields"]))
         with patch("sys.argv", argv+["--resume"]), patch.object(extraction, "make_infer") as loader, contextlib.redirect_stdout(io.StringIO()):
             extraction.main()
@@ -592,6 +592,69 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("'no transplant reactions'", self.questions["R05"]["field_instructions"])
         self.assertIn("simultaneously", self.questions["R06"]["field_instructions"])
         self.assertIn("Deduplicate", self.questions["R14"]["field_instructions"])
+        self.assertLess(sum(len(q["field_instructions"].split()) for q in self.questions.values()), 1100)
+        for fid in ["R02", "R03", "R04"]:
+            self.assertIn("throughout the admission", self.questions[fid]["field_instructions"])
+        self.assertIn("highest, not the first", self.questions["R04"]["field_instructions"])
+
+    def test_format_tolerance_restores_source_quote_without_changing_facts(self):
+        source = "Neutropenic fever  Temp 100.3 at 0020 on 2/26."
+        raw = json.dumps([dict(field_id="R04", answers="100.3F",
+            evidence_from_text="Neutropenic fever - Temp 100.3 at 0020 on 2/26")])
+        rows, error, _ = extraction.request_bundle(lambda *_: raw, "Prompt", ["R04"],
+            self.questions, "baseline", retries=0, require_evidence=True, source_text=source)
+        self.assertFalse(error)
+        self.assertEqual(rows[0]["answers"], "100.3")
+        self.assertEqual(rows[0]["evidence_from_text"], source[:-1])
+        for quote in ["Neutropenic fever Temp 103.3", "Neutropenic fever Temp - 100.3"]:
+            self.assertEqual(extraction.quote_spans(source, quote), [])
+        self.assertEqual(extraction.quote_spans("days 1 5", "days 1 - 5"), [])
+        self.assertEqual(extraction.quote_spans("Temp - 5", "Temp 5"), [])
+        self.assertEqual(extraction.quote_spans("No hypotension", "No - hypotension"), [(0, 14)])
+        self.assertEqual(extraction.quote_spans("hypotension absent", "hypotension not absent"), [])
+        self.assertTrue(extraction.quote_spans("Patient\u2019s fever", "Patient's fever"))
+
+    def test_temperature_suffix_normalization_rejects_units_or_prose_ambiguity(self):
+        for value in ["100.4F", "100.4 F", "100.4\u00b0F", "100.4 Fahrenheit"]:
+            self.assertEqual(normalize_value("max_temp", value), (100.4, "valid"))
+        for value in ["100.4C", "38 C", "100.4-100.6F", "Tmax 100.4F", "100.4F or 101F"]:
+            self.assertEqual(normalize_value("max_temp", value)[1], "invalid")
+        self.assertEqual(normalize_value("total_dose_toci", "1F")[1], "invalid")
+
+    def test_candidate_context_survives_note_abstentions_without_extra_calls(self):
+        encounter = dict(self.encounters[0], notes=[
+            dict(source="discharge", date="2020-02-01", admit_date="2020-01-01",
+                 text="On January 12. Tmax 100.4 F. The next day. Tmax 100.6 F. No fever today."),
+            dict(source="history", date="2020-01-01", text="HISTORY_SENTINEL. Fever in a previous admission.")])
+        prompts = []
+        def infer(messages, mode):
+            prompts.append(messages[-1]["content"])
+            return json.dumps([dict(field_id="R04", answers="not mentioned", evidence_from_text="",
+                                    reasoning_trace="MODEL_RATIONALE_SENTINEL")])
+        rows, _ = extraction.extract_bundle(infer, encounter, ["R04"], self.questions,
+                                           "baseline", "per_note", retries=0)
+        self.assertEqual(len(prompts), 2)
+        for text in ["On January 12.", "Tmax 100.4 F.", "Tmax 100.6 F.", "No fever today."]:
+            self.assertIn(text, prompts[-1])
+        self.assertNotIn("HISTORY_SENTINEL", prompts[-1])
+        self.assertNotIn("MODEL_RATIONALE_SENTINEL", prompts[-1])
+        self.assertEqual(rows[0]["answers"], "not mentioned")  # Retrieval does not assign an answer.
+        self.assertTrue(rows[0]["extraction_success"])
+
+    def test_audit_flags_source_gaps_without_treating_terms_as_proof(self):
+        gold = self.gold
+        gold[1].update(toci_y_n="Y", toci_start_date="2021-01-12", total_dose_toci="1")
+        write_csv(self.path / "toci_ptcy_crs.csv", gold, list(gold[0]))
+        audit = data_audit(self.path, self.path / "target_filtered.csv",
+                           self.path / "toci_ptcy_crs.csv", self.encounters, self.questions)
+        coverage = audit["encounter_note_coverage"][1]
+        self.assertEqual(coverage["note_counts"], dict(progress=0, discharge=1, history=0))
+        self.assertIsNone(coverage["first_progress_date"])
+        self.assertEqual({r["field_id"] for r in audit["labeled_value_candidate_gaps"]}, {"R11", "R12", "R14"})
+        self.assertIn("does not prove", audit["candidate_screening_note"])
+        prompt = extraction.build_prompt(self.encounters[1], ["R11"], self.questions, "baseline")
+        self.assertNotIn("2021-01-12", prompt)
+        self.assertNotIn("GT_COMMENT_SENTINEL", prompt)
 
     def test_single_extraction_call_no_judge_for_answer_or_not_mentioned(self):
         cases = [("R05", "N", "No CRS-associated hypotension occurred.", "N"),

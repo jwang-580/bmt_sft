@@ -26,7 +26,7 @@ from prompt_eval.evaluate_gemma4_extraction import (generate, load_model, resolv
 from prompt_eval.extraction_prompts import (DEFAULT_MODES, EXTRACTION_SYSTEM_PROMPT,
     build_user_prompt, mode_settings)
 from research_eval.research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, ROOT, DATE_FIELDS,
-    data_audit, file_hash, load_encounters, load_questions, normalize_value,
+    candidate_spans, data_audit, file_hash, load_encounters, load_questions, normalize_value,
     render_note, select_notes, write_json)
 from research_eval.research_eval import evaluate_file, prediction_failed
 
@@ -76,14 +76,33 @@ def build_prompt(encounter, fields, questions, mode, *, note_text=None, note_dat
 
 
 def quote_spans(source_text, quote):
-    """Find exact quotes, tolerating only whitespace differences."""
+    """Match quotes with whitespace/typographic tolerance, retaining source offsets."""
     if not quote.strip():
         return []
     pattern = r"\s+".join(re.escape(word) for word in quote.split())
-    return [(match.start(), match.end()) for match in re.finditer(pattern, source_text)]
+    exact = [(match.start(), match.end()) for match in re.finditer(pattern, source_text)]
+    if exact:
+        return exact
+    # Only standalone separators may be added/omitted. Preserve words, negation,
+    # decimal points, signs and ranges; do not use fuzzy or semantic matching.
+    raw_tokens = quote.split()
+    tokens = [word for i, word in enumerate(raw_tokens)
+              if not (word in {"-", "\u2013", "\u2014"} and 0 < i < len(raw_tokens)-1
+                      and raw_tokens[i-1][-1].isalpha() and raw_tokens[i+1][0].isalpha())]
+    if not tokens:
+        return []
+    equivalents = {c: "['\u2018\u2019]" for c in "'\u2018\u2019"}
+    equivalents.update({c: '["\u201c\u201d]' for c in '"\u201c\u201d'})
+    equivalents.update({c: "[-\u2013\u2014]" for c in "-\u2013\u2014"})
+    words = ["".join(equivalents.get(c, re.escape(c)) for c in word) for word in tokens]
+    pattern = words[0]
+    for i in range(1, len(words)):
+        separator = r"\s+(?:[-\u2013\u2014]\s+)?" if tokens[i-1][-1].isalpha() and tokens[i][0].isalpha() else r"\s+"
+        pattern += separator + words[i]
+    return [(m.start(), m.end()) for m in re.finditer(pattern, source_text)]
 
 
-def collect_excerpts(note, rows):
+def collect_excerpts(note, rows, targets=()):
     """Select whole sentences/paragraphs containing source-matched quotes; retain negation/dates.
 
     The model reads the entire original note. This is evidence selection afterward,
@@ -100,6 +119,13 @@ def collect_excerpts(note, rows):
             left = boundaries[max(0, bisect_right(boundaries, start)-1)]
             right = boundaries[min(len(boundaries)-1, bisect_left(boundaries, end))]
             spans.append((left, right))
+    # Keep independently selected source context even when the first pass abstains.
+    # Whole notes still enter the first call; no extra calls or note chunks are made.
+    for start, end in candidate_spans(text, targets):
+        left = max(0, bisect_right(boundaries, start)-1)
+        right = min(len(boundaries)-1, bisect_left(boundaries, end))
+        # Neighboring sentences help retain dates, indications and negation.
+        spans.append((boundaries[max(0, left-1)], boundaries[min(len(boundaries)-1, right+1)]))
     merged = []
     for start, end in sorted(set(spans)):
         if merged and start <= merged[-1][1]:
@@ -224,12 +250,17 @@ def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require
                     else:
                         if not quote:
                             raise ValueError(f"{row['field_id']}: an extracted answer requires a supporting quote")
-                        if not quote_spans(source_text, quote):
-                            raise ValueError("evidence_from_text must be an exact quote from the supplied note")
+                        matches = quote_spans(source_text, quote)
+                        if not matches:
+                            raise ValueError(f"{row['field_id']}: evidence_from_text must match the supplied note")
+                        start, end = matches[0]
+                        row["evidence_from_text"] = source_text[start:end]
                         if status == "empty":
                             if target not in DATE_FIELDS | {"max_temp"}:
                                 raise ValueError(f"{row['field_id']}: use not mentioned with an empty quote for missing information")
                             row["answers"] = "N/A"
+                        elif target == "max_temp":
+                            row["answers"] = format(normalize_value(target, row["answers"])[0], "g")
             for row in rows:
                 row["extraction_status"] = ("not_mentioned" if normalize_value(
                     questions[row["field_id"]]["target_column"], row["answers"])[1] == "not_mentioned" else "extracted")
@@ -288,7 +319,7 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
             attempts.extend(dict(stage="note", note_index=note_index, source=note["source"], **a) for a in log)
             if error:
                 break
-            excerpts = collect_excerpts(note, note_rows)
+            excerpts = collect_excerpts(note, note_rows, [questions[fid]["target_column"] for fid in relevant])
             findings.append(dict(note={k: v for k, v in note.items() if k != "text"}, excerpts=excerpts))
         if not error:
             evidence_text = render_evidence_notes(findings)
@@ -458,7 +489,7 @@ def main():
     fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     manifest = dict(fingerprint=fingerprint, **signature, record_ids=[e["record_id"] for e in encounters],
                     variants=variants, bundles=batches, dry_run=args.dry_run,
-                    prompt_contract="research_question_instructions_v2")
+                    prompt_contract="research_question_instructions_v3")
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     manifest_path, pred_path = output / "run_manifest.json", output / "research_predictions.json"
@@ -500,6 +531,7 @@ def main():
         write_json(manifest_path, manifest)
     print(f"Cohort: {len(all_encounters)}; selected: {len(encounters)}; GT matches: {audit['matched_ground_truth']}")
     print(f"Note coverage: {audit['note_coverage']}; date conflicts: {audit['note_date_conflicts']}")
+    print(f"Labeled values without candidate terms: {len(audit['labeled_value_candidate_gaps'])}; review data_audit.json")
     print(f"All {len(questions)} research fields; bundle sizes: {[len(b) for b in batches]}")
     if args.dry_run:
         if args.save_prompt_preview:

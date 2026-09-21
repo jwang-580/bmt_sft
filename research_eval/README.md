@@ -53,19 +53,31 @@ Each extraction returns the standard SFT answer records, including `answers`,
 specifies what supports its answer, which misleading observations to exclude, and
 how to handle missing information. There is one extraction call per note/bundle
 and one final extraction per bundle, with no judge or additional validation call.
+The v3 questions shorten the instructions while retaining the shared SFT system
+prompt, fixed layout, response keys, and five-question bundles. This reduces the
+instruction copying seen in failed runs; a model rerun is still needed to verify
+that repetition stops. Increasing the output limit does not fix repetition loops.
 
 | Information in the source | Requested answer | Requested quote |
 | --- | --- | --- |
 | Documented value or event | Value / `Y` | Exact quote supporting this specific field |
 | Explicit absence/non-use | `N` / zero | Exact statement of absence/non-use |
-| Explicit non-applicability of a date/temperature | `N/A`, e.g. fever date when no fever occurred | Statement establishing non-applicability |
+| Explicit non-applicability of a date/temperature | `N/A`, e.g. no fever throughout the admission | Statement establishing non-applicability for that period |
 | Requested fact is not documented | `not mentioned` | Empty string |
 
 Missing dates/counts can be `not mentioned` even when the underlying event is
 described. For example, R05 explicitly says that 'no fevers', transplant day, and
 'no transplant reactions' do not establish CRS-associated hypotension or its absence.
-The extraction model makes this semantic decision using the question instructions.
-Code checks exact quote membership and requires quotes for extracted values.
+Daily no-fever statements and a normal current temperature do not establish an
+afebrile admission. R04 requests the highest value across the first fever episode,
+not its first measurement; episodes beginning more than three days later are excluded.
+The extraction model makes these semantic decisions using the question instructions.
+Code requires source-matched quotes for extracted values. Matching tolerates
+whitespace, typographic quotes/dashes, and a standalone dash separator between
+words. Accepted quotes are restored to the exact source wording. It does not use
+fuzzy matching or tolerate changed words, negation, numbers, signs or numeric ranges.
+Explicit Fahrenheit suffixes such as `100.4F` are normalized to `100.4`; arbitrary
+prose, ranges and Celsius suffixes are not silently treated as Fahrenheit.
 For an explicit `not mentioned` answer, any stray quote is cleared without
 guessing a different answer; the original response remains in the attempt log.
 Legacy empty `N/A` responses are
@@ -89,6 +101,12 @@ These checks do not independently prove that an exact quote supports an answer;
 clinical relevance remains the extraction model's responsibility and needs accuracy
 evaluation. Source-matched quotes contribute their enclosing sentences/paragraphs
 to the final pass, preserving negation and dates. Overlapping passages are merged.
+In addition, question-specific candidate terms select original passages with
+neighboring sentences for dates and attribution. For example, fever/temperature
+passages are retained for R02-R04 and tocilizumab/Actemra passages for R11-R14.
+These passages are retained even when the first pass abstains. Keyword matching
+only selects context: it never assigns an answer, proves CRS attribution or turns
+silence into a negative. The original note-source routing still applies.
 
 The final call receives these **verbatim source excerpts**, labeled with their
 source and note dates, as its `Clinical note`. Intermediate model answers and
@@ -96,13 +114,16 @@ rationales are not inserted as clinical facts. The final model answers the same
 5/5/4 question bundles using the standard extraction prompt and the research field
 instructions. H&P supplies baseline context for bundle 2; discharge supplies the wider course.
 
-`not mentioned` contributes no excerpts and is never converted into a negative
-clinical finding. Final-stage `not mentioned` is scoped to the selected excerpts,
+`not mentioned` contributes no model-selected quote and is never converted into a
+negative clinical finding; independent candidate passages can still be retained.
+Final-stage `not mentioned` is scoped to the selected excerpts,
 not a claim about unreviewed chart content. Successful note extractions are saved
 immediately and reused on resume; failed extractions fail the bundle. The workflow keeps
 each original note intact in the first pass. A long enclosing passage remains
-subject to the input limit instead of being truncated. Events not represented by
-first-pass quotes can be missed in the final pass; this needs accuracy evaluation.
+subject to the input limit instead of being truncated. There are no chunked note
+calls or additional model calls. Candidate selection reduces dependence on first-pass
+answers, but events missed by both quotes and candidate terms can still be lost.
+The final model can still choose an incorrect value; accuracy requires a model rerun.
 
 Individual progress notes have a median of 7,522 characters;
 the largest discharge summary is 62,493 characters. These are text lengths, not
@@ -244,14 +265,20 @@ Useful options:
 
 - `data_audit.json`: input choice, note coverage, date conflicts, label counts, and
   the exact encounter/field identifiers of invalid or missing GT labels.
+  `encounter_note_coverage` adds per-encounter source counts, missing sources and
+  first/last progress-note dates. `labeled_value_candidate_gaps` flags nonnegative
+  labeled facts (positive events, nonzero counts, dates and temperatures) without
+  candidate terms in the question's available sources. This is keyword screening,
+  not evidence verification or a GT correction; missing terms can reflect missing
+  notes or different wording. Neither labels nor audit flags enter model prompts.
 - `run_manifest.json`: selected encounters, planned variants/bundles, configuration,
   prompt-contract label, and hashes of input files and relevant code.
 - `prompt_preview.json`: optional first-encounter prompts, with one intact note per
   evidence call under `per_note`; never a fabricated inference result.
 - `note_evidence.json`: standard field IDs, answers, and evidence quotes saved after
   each successful extraction, with encounter/source/date/model/mode metadata. Reusable
-  during resume; only original source passages selected by the quotes enter the
-  final clinical-note input, not the cached answer values.
+  during resume; original source passages selected by quotes and candidate terms
+  enter the final clinical-note input, not the cached answer values.
 - `research_predictions.json`: atomic checkpoint, one record per encounter/field/variant;
   carries standard answer/evidence/rationale metadata plus research source coverage.
 - `research_failures.jsonl`: failed attempts with stage, source, raw answer text,
@@ -276,7 +303,7 @@ The updated question instructions change the run contract: start a **new output
 directory** so results from previous prompts are not reused:
 
 ```powershell
-python research_eval/research_extract.py --models fine_tuning/outputs/gemma4_12b_lora/final --limit 0 --output_dir research_eval/results/gemma_finetuned_questions_v2
+python research_eval/research_extract.py --models fine_tuning/outputs/gemma4_12b_lora/final --limit 0 --output_dir research_eval/results/gemma_finetuned_questions_v3
 ```
 
 Subsequent restarts of this new run use the same command with `--resume`.
