@@ -65,10 +65,25 @@ Missing dates/counts can be `not mentioned` even when the underlying event is
 described. For example, R05 explicitly says that 'no fevers', transplant day, and
 'no transplant reactions' do not establish CRS-associated hypotension or its absence.
 The extraction model makes this semantic decision using the question instructions.
-Code checks exact quote membership, requires quotes for extracted values, and
-requires an empty quote for `not mentioned`. Legacy empty `N/A` responses are
+Code checks exact quote membership and requires quotes for extracted values.
+For an explicit `not mentioned` answer, any stray quote is cleared without
+guessing a different answer; the original response remains in the attempt log.
+Legacy empty `N/A` responses are
 normalized to `not mentioned`. Failed format/quote checks retry the extraction;
 unresolved failures use `answers: null` and `extraction_success: false`.
+
+Every new prediction also includes an explicit `extraction_status`:
+
+| Result | `answers` | `extraction_status` | `extraction_success` |
+| --- | --- | --- | --- |
+| Documented answer | Extracted value, including explicit `N`, `0`, or applicable `N/A` | `extracted` | `true` |
+| No supporting information found | `not mentioned` | `not_mentioned` | `true` |
+| Parsing, generation, or quote-validation failure | `null` | `failed` | `false` |
+
+Successful results have an empty `parse_error`. Failed results retain the error
+and raw attempt in `research_failures.jsonl`. A malformed or null model answer
+cannot be relabeled as `not mentioned`. Resume skips successful `not_mentioned`
+results and retries failures. Cached note fields carry the same successful statuses.
 
 These checks do not independently prove that an exact quote supports an answer;
 clinical relevance remains the extraction model's responsibility and needs accuracy
@@ -266,9 +281,12 @@ python research_eval/research_extract.py --models fine_tuning/outputs/gemma4_12b
 
 Subsequent restarts of this new run use the same command with `--resume`.
 
-The parser accepts a complete JSON array inside Markdown/prose or a standard
-response wrapper, and a single record for a one-question call. It still rejects
-truncated JSON, duplicate/missing field IDs, invalid values, and quotes absent from the source.
+The parser accepts complete JSON arrays, standard response wrappers, and separate
+complete field objects (including JSONL or individually fenced records). It combines
+records only when every requested field ID occurs exactly once. Bracketed prose
+such as `[End of response]` is not itself a second JSON answer. Truncated containers,
+duplicate/missing field IDs, null/invalid answers, and quotes absent from the source
+are still rejected; the parser never salvages inner records from a broken array.
 Empty final output is reported explicitly; unfinished thought text is never used
 as a clinical answer. If failures persist, inspect the last failed attempt in
 `research_failures.jsonl`; the prediction file alone cannot show what the model generated.
@@ -296,7 +314,8 @@ Scoring rules:
   **not** a wildcard accepting any predicted temperature.
 - `not mentioned` is a separate abstention, reported as `not_mentioned_predictions`.
   It counts as incorrect for scorable GT and does not match a negative, zero, or
-  not-applicable GT value. It is not counted as a parsing failure.
+  not-applicable GT value. It is not counted as a parsing failure. Summary and
+  per-field metrics separately report `failed_predictions`.
 - Report exact accuracy separately from tolerance accuracy (default ±1 day and
   ±0.1 F). Counts require exact matches. MAE uses paired valid values and reports
   the paired denominator. Missing values still lower overall accuracy.

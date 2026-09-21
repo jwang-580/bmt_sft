@@ -52,7 +52,7 @@ def load_predictions(path, questions):
 
 
 def prediction_failed(row):
-    return bool(row.get("parse_error") or row.get("error")) or str(
+    return row.get("extraction_status") == "failed" or bool(row.get("parse_error") or row.get("error")) or str(
         row.get("extraction_success", True)).lower() in {"false", "0", "no"}
 
 
@@ -132,6 +132,7 @@ def score_variant(predictions, gold, cohort, questions, *, date_tolerance=1, tem
                    prediction_coverage=sum(m["predictions_present"] for m in metrics)/len(details) if details else 0,
                    valid_prediction_coverage=sum(d["prediction_status"] in {"valid", "empty"} for d in details)/len(details) if details else 0,
                    unexpected_predictions=unexpected,
+                   failed_predictions=sum(m["failed_predictions"] for m in metrics),
                    not_mentioned_predictions=sum(m["not_mentioned_predictions"] for m in metrics),
                    exact_accuracy=sum(m["correct"] for m in metrics)/n if n else None,
                    macro_exact_accuracy=sum(nonempty)/len(nonempty) if nonempty else None,

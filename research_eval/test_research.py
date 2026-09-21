@@ -613,7 +613,7 @@ class ResearchTests(unittest.TestCase):
                 self.assertNotIn("evidence_review", attempts[0])
 
     def test_simple_quote_checks_reject_missing_or_inconsistent_evidence(self):
-        for answer, quote in [("Y", ""), ("not mentioned", "No hypotension."),
+        for answer, quote in [("Y", ""),
                               ("N/A", "Patient is day -6."), ("N", "Invented quote")]:
             infer = Mock(return_value=json.dumps([dict(field_id="R05", answers=answer, evidence_from_text=quote)]))
             infer.last_diagnostics = {}
@@ -622,6 +622,135 @@ class ResearchTests(unittest.TestCase):
             self.assertEqual(rows, [])
             self.assertTrue(error)
             self.assertEqual(infer.call_count, 1)
+
+    def test_explicit_not_mentioned_discards_stray_quote_without_failing_bundle(self):
+        # A complete three-field fixture using the values in the reported excerpt.
+        # It does not assume the missing end of the original five-field response.
+        quote = "- No fevers, chills, night sweats, or rigors."
+        raw = "```json\n" + json.dumps([
+            dict(field_id="R01", answers="not mentioned", evidence_from_text=""),
+            dict(field_id="R02", answers="not mentioned", evidence_from_text=quote,
+                 reasoning_trace="The note states 'No fevers', so the onset date is not applicable."),
+            dict(field_id="R03", answers="N/A", evidence_from_text=quote),
+        ]) + "\n```"
+        infer = Mock(return_value=raw)
+        infer.last_diagnostics = {}
+        rows, error, attempts = extraction.request_bundle(infer, "Unchanged prompt",
+            ["R01", "R02", "R03"], self.questions, "baseline", retries=1,
+            require_evidence=True, source_text=quote)
+        self.assertFalse(error)
+        self.assertEqual(infer.call_count, 1)
+        self.assertEqual([row["answers"] for row in rows], ["not mentioned", "not mentioned", "N/A"])
+        self.assertEqual([row["extraction_status"] for row in rows], ["not_mentioned", "not_mentioned", "extracted"])
+        self.assertEqual(rows[1]["evidence_from_text"], "")
+        self.assertEqual(attempts[0]["raw_generation"], raw)
+        self.assertEqual(extraction.collect_excerpts(dict(text=quote), rows[:2]), [])
+        # A missing R04/R05 still means this is an incomplete five-field bundle.
+        with self.assertRaisesRegex(ValueError, "missing=.*R04.*R05"):
+            extraction.parse_response(raw, ["R01", "R02", "R03", "R04", "R05"],
+                                      self.questions, "baseline", require_evidence=True)
+
+    def test_separate_json_records_and_bracketed_prose_are_not_ambiguous(self):
+        fields = ["R06", "R07", "R08", "R09", "R10"]
+        rows = [dict(field_id=fid, answers="not mentioned", evidence_from_text="") for fid in fields]
+        objects = [json.dumps(row) for row in rows]
+        outputs = ["\n".join(objects), ",\n".join(objects),
+                   "\n".join("```json\n" + obj + "\n```" for obj in objects),
+                   json.dumps(rows[:2]) + "\n" + json.dumps(rows[2:]),
+                   "[results]\n" + json.dumps(rows) + "\n[End of response] {summary}",
+                   '["field_id", "answers", "evidence_from_text"]\n' + json.dumps(rows)]
+        for raw in outputs:
+            with self.subTest(raw=raw):
+                parsed = extraction.parse_response(raw, fields, self.questions, "baseline", require_evidence=True)
+                self.assertEqual(parsed, rows)
+                infer = Mock(return_value=raw)
+                infer.last_diagnostics = {}
+                accepted, error, _ = extraction.request_bundle(infer, "Unchanged prompt", fields,
+                    self.questions, "baseline", retries=0, require_evidence=True, source_text="Unrelated history.")
+                self.assertFalse(error)
+                self.assertTrue(all(r["extraction_status"] == "not_mentioned" for r in accepted))
+                self.assertEqual(infer.call_count, 1)
+
+    def test_parser_never_salvages_truncated_containers_or_conflicting_records(self):
+        rows = [dict(field_id="R07", answers="not mentioned", evidence_from_text=""),
+                dict(field_id="R08", answers="not mentioned", evidence_from_text="")]
+        payload = json.dumps(rows)
+        outputs = [payload[:-1], payload[:-2], payload + '\n{"field_id":',
+                   json.dumps(rows[0]) + '\n{"field_id":"R08","answers":',
+                   payload + payload, payload + json.dumps(dict(rows[0], answers="Y")),
+                   json.dumps({"records": rows, "answers": rows})]
+        for raw in outputs:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                extraction.parse_response(raw, ["R07", "R08"], self.questions, "baseline", require_evidence=True)
+        with self.assertRaisesRegex(ValueError, "duplicates=.*R07"):
+            extraction.parse_response(payload + payload, ["R07", "R08"], self.questions, "baseline")
+
+    def test_output_distinguishes_not_mentioned_extracted_and_failed(self):
+        for answer, quote, expected in [("not mentioned", "", "not_mentioned"),
+                                        ("N", "No CRS occurred.", "extracted")]:
+            encounter = dict(self.encounters[0], notes=[dict(source="discharge", date="2020-02-01", text="No CRS occurred.")])
+            raw = json.dumps([dict(field_id="R01", answers=answer, evidence_from_text=quote)])
+            rows, _ = extraction.extract_bundle(lambda *_: raw, encounter, ["R01"], self.questions,
+                                                  "baseline", "full", retries=0)
+            row = rows[0]
+            self.assertEqual(row["answers"], answer)
+            self.assertEqual(row["extraction_status"], expected)
+            self.assertTrue(row["extraction_success"])
+            self.assertEqual(row["parse_error"], "")
+        for raw in ('[{"field_id":"R01","answers":null,"evidence_from_text":""}]',
+                    'broken JSON', '[{"field_id":"R01","answers":"not mentioned"}'):
+            with self.subTest(raw=raw):
+                rows, _ = extraction.extract_bundle(lambda *_: raw, self.encounters[0], ["R01"], self.questions,
+                                                      "baseline", "full", retries=0)
+                row = rows[0]
+                self.assertIsNone(row["answers"])
+                self.assertEqual(row["extraction_status"], "failed")
+                self.assertFalse(row["extraction_success"])
+                self.assertTrue(row["parse_error"])
+
+    def test_failure_and_not_mentioned_are_counted_separately(self):
+        gt = dict(self.gold[0])
+        key = ("001", "2020-01-10")
+        preds = [dict(record_id=record_id(key), field_id="R07", answers="not mentioned",
+                      extraction_status="not_mentioned", extraction_success=True, parse_error=""),
+                 dict(record_id=record_id(key), field_id="R08", answers=None,
+                      extraction_status="failed", extraction_success=False, parse_error="Invalid JSON"),
+                 dict(record_id=record_id(key), field_id="R09", answers="not mentioned",
+                      extraction_status="failed")]
+        summary, metrics, details = score_variant(preds, {key: gt}, {key: gt}, self.questions)
+        self.assertEqual(summary["not_mentioned_predictions"], 1)
+        self.assertEqual(summary["failed_predictions"], 2)
+        by_id = {row["field_id"]: row for row in details}
+        self.assertEqual(by_id["R07"]["prediction_status"], "not_mentioned")
+        self.assertEqual(by_id["R08"]["prediction_status"], "failed")
+        self.assertEqual(by_id["R09"]["prediction_status"], "failed")
+
+    def test_resume_skips_not_mentioned_and_retries_real_failures(self):
+        output = self.path / "statuses"
+        argv = ["research_extract.py", "--data_dir", str(self.path), "--output_dir", str(output),
+                "--limit", "1", "--note_strategy", "full", "--parse_retries", "0", "--max_consecutive_failures", "0"]
+        calls = []
+        broken = True
+        def infer(messages, mode):
+            fields = re.findall(r"^Field (R\d+)$", messages[-1]["content"], flags=re.M)
+            calls.append(fields)
+            if broken and "R07" in fields:
+                return '[{"field_id":"R07","answers":'
+            return '\n'.join(json.dumps(dict(field_id=fid, answers="not mentioned", evidence_from_text="")) for fid in fields)
+        with patch("sys.argv", argv), patch.object(extraction, "make_infer", return_value=(infer, lambda: None)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            extraction.main()
+        saved = json.loads((output / "research_predictions.json").read_text())
+        self.assertEqual(sum(r["extraction_status"] == "not_mentioned" for r in saved), 9)
+        self.assertEqual(sum(r["extraction_status"] == "failed" for r in saved), 5)
+        calls.clear()
+        broken = False
+        with patch("sys.argv", argv + ["--resume"]), patch.object(extraction, "make_infer", return_value=(infer, lambda: None)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            extraction.main()
+        self.assertEqual(calls, [["R06", "R07", "R08", "R09", "R10"]])
+        saved = json.loads((output / "research_predictions.json").read_text())
+        self.assertTrue(all(r["extraction_status"] == "not_mentioned" for r in saved))
 
 
 if __name__ == "__main__":

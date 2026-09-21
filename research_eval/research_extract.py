@@ -119,6 +119,55 @@ def render_evidence_notes(findings):
     return "\n\n".join(sections)
 
 
+def decode_record_payloads(text):
+    """Read complete record containers/objects, including JSONL, without repairing JSON.
+
+    Bracketed prose is not a second payload. Conversely, an unfinished JSON
+    container must fail at its opening delimiter, not expose its nested records
+    as a falsely complete response.
+    """
+    decoder = json.JSONDecoder()
+    records = []
+    position = 0
+    found = False
+    while match := re.search(r"[\[{]", text[position:]):
+        start = position + match.start()
+        try:
+            payload, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            fragment = text[start:]
+            looks_like_json = (re.match(r'''\{\s*(?:["']|[A-Za-z_]\w*\s*:|$)''', fragment)
+                               or re.match(r'''\[\s*(?:[\[\{"'\d-]|true\b|false\b|null\b|$)''', fragment))
+            if looks_like_json:
+                raise
+            # A label such as [results] or {end of response} is ordinary text.
+            position = start + 1
+            continue
+        position = end
+        if isinstance(payload, dict):
+            if "field_id" in payload or ("answers" in payload and not isinstance(payload["answers"], list)):
+                batch = [payload]
+            else:
+                containers = [payload[key] for key in ("records", "extractions", "answers")
+                              if isinstance(payload.get(key), list)]
+                if len(containers) > 1:
+                    raise ValueError("Ambiguous JSON wrapper: multiple record arrays")
+                if not containers:
+                    continue
+                batch = containers[0]
+        elif isinstance(payload, list) and (not payload or any(isinstance(row, dict) for row in payload)):
+            batch = payload
+        else:
+            continue
+        found = True
+        if any(not isinstance(row, dict) for row in batch):
+            raise ValueError("Expected field records as JSON objects")
+        records.extend(batch)
+    if not found:
+        raise ValueError("No complete JSON field records in final answer; see failure diagnostics")
+    return records
+
+
 def parse_response(text, fields, questions, mode, *, require_evidence=False):
     """Require every requested ID exactly once; never assign malformed output by position."""
     text = final_answer_text(text)
@@ -128,33 +177,22 @@ def parse_response(text, fields, questions, mode, *, require_evidence=False):
         records = [{"field_id": m[1], "answers": m[2].strip()} for m in
                    re.finditer(r"^Field\s+(\S+)\s*:\s*(.*?)\s*$", text, flags=re.M)]
     else:
-        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
-        start = re.search(r"[\[{]", clean)
-        if start is None:
-            raise ValueError("No JSON object or array in final answer; see failure diagnostics")
-        # Accept prose/fences around one complete JSON payload, but never salvage
-        # partial objects from a truncated array or invent missing fields.
-        records, end = json.JSONDecoder().raw_decode(clean, start.start())
-        if re.search(r"[\[{]", clean[end:]):
-            raise ValueError("Multiple or ambiguous JSON payloads in final answer")
-        if isinstance(records, dict):
-            if "field_id" in records and len(fields) == 1:
-                records = [records]
-            else:
-                for key in ("records", "extractions", "answers"):
-                    if isinstance(records.get(key), list):
-                        records = records[key]
-                        break
+        records = decode_record_payloads(text)
     if not isinstance(records, list) or any(not isinstance(r, dict) for r in records):
         raise ValueError("Expected an array of field records")
     ids = [str(r.get("field_id", "")) for r in records]
     if Counter(ids) != Counter(fields):
-        raise ValueError("Response must contain every requested field_id exactly once, without extra IDs")
+        duplicates = sorted(fid for fid, count in Counter(ids).items() if count > 1)
+        missing = sorted(set(fields) - set(ids))
+        extra = sorted(set(ids) - set(fields))
+        raise ValueError(f"Expected each requested field_id exactly once: duplicates={duplicates}, missing={missing}, extra={extra}")
     by_id = dict(zip(ids, records))
     for fid in fields:
         row = by_id[fid]
         if "answers" not in row:
             raise ValueError(f"Missing answers for {fid}")
+        if row["answers"] is None:
+            raise ValueError(f"Null answer for {fid}; missing documentation must be explicitly returned as not mentioned")
         if normalize_value(questions[fid]["target_column"], row["answers"])[1] == "invalid":
             raise ValueError(f"Invalid answer type/value for {fid}")
         if require_evidence and not isinstance(row.get("evidence_from_text"), str):
@@ -179,8 +217,9 @@ def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require
                     target = questions[row["field_id"]]["target_column"]
                     _, status = normalize_value(target, row["answers"])
                     if status == "not_mentioned" or (status == "empty" and not quote):
-                        if quote:
-                            raise ValueError("not mentioned requires an empty evidence_from_text")
+                        # An explicit abstention supplies no evidence. Discard a
+                        # stray quote without inferring a different answer from it.
+                        # The original response remains in the attempt log.
                         row.update(answers="not mentioned", evidence_from_text="")
                     else:
                         if not quote:
@@ -191,6 +230,9 @@ def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require
                             if target not in DATE_FIELDS | {"max_temp"}:
                                 raise ValueError(f"{row['field_id']}: use not mentioned with an empty quote for missing information")
                             row["answers"] = "N/A"
+            for row in rows:
+                row["extraction_status"] = ("not_mentioned" if normalize_value(
+                    questions[row["field_id"]]["target_column"], row["answers"])[1] == "not_mentioned" else "extracted")
             attempts.append(dict(attempt=attempt+1, raw_generation=raw, diagnostics=diagnostics, error=""))
             return rows, "", attempts
         except Exception as exc:
@@ -234,7 +276,8 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
                     # Cache standard response fields. No model-inferred answers or
                     # rationales are inserted into the final clinical-note content.
                     note_rows = [{"field_id": r["field_id"], "answers": r["answers"],
-                                  "evidence_from_text": r["evidence_from_text"]}
+                                  "evidence_from_text": r["evidence_from_text"],
+                                  "extraction_status": r["extraction_status"]}
                                  for r in note_rows]
                     if evidence_cache is not None:
                         evidence_cache[key] = dict(record_id=encounter["record_id"], model=cache_scope, mode=mode,
@@ -266,6 +309,7 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
         prediction = {k: encounter[k] for k in ("record_id", "record_id_type", "date", "MRN", "bmt_date")}
         prediction.update({k: q[k] for k in ("field_id", "field_category", "field_name", "field_instructions", "target_column")})
         prediction.update(answers=raw.get("answers"), extraction_success=not bool(error),
+                          extraction_status="failed" if error else raw["extraction_status"],
                           parse_error=error, note_sources=q["note_sources"],
                           available_note_counts=dict(Counter(n["source"] for n in notes)),
                           missing_note_sources=[s for s in q["note_sources"] if not any(n["source"] == s for n in notes)])
