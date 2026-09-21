@@ -22,7 +22,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from prompt_eval.evaluate_gemma4_extraction import (generate, load_model, resolve_models,
-    format_messages_for_processor)
+    format_messages_for_processor, final_answer_text)
 from prompt_eval.extraction_prompts import (DEFAULT_MODES, EXTRACTION_SYSTEM_PROMPT,
     build_user_prompt, mode_settings)
 from research_eval.research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, ROOT,
@@ -111,12 +111,30 @@ def render_evidence_notes(findings):
 
 def parse_response(text, fields, questions, mode, *, require_evidence=False):
     """Require every requested ID exactly once; never assign malformed output by position."""
+    text = final_answer_text(text)
+    if not text:
+        raise ValueError("Empty final answer: no JSON was generated after the thought/turn markers; see failure diagnostics")
     if mode == "non_json":
         records = [{"field_id": m[1], "answers": m[2].strip()} for m in
                    re.finditer(r"^Field\s+(\S+)\s*:\s*(.*?)\s*$", text, flags=re.M)]
     else:
-        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
-        records = json.loads(clean)
+        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
+        start = re.search(r"[\[{]", clean)
+        if start is None:
+            raise ValueError("No JSON object or array in final answer; see failure diagnostics")
+        # Accept prose/fences around one complete JSON payload, but never salvage
+        # partial objects from a truncated array or invent missing fields.
+        records, end = json.JSONDecoder().raw_decode(clean, start.start())
+        if re.search(r"[\[{]", clean[end:]):
+            raise ValueError("Multiple or ambiguous JSON payloads in final answer")
+        if isinstance(records, dict):
+            if "field_id" in records and len(fields) == 1:
+                records = [records]
+            else:
+                for key in ("records", "extractions", "answers"):
+                    if isinstance(records.get(key), list):
+                        records = records[key]
+                        break
     if not isinstance(records, list) or any(not isinstance(r, dict) for r in records):
         raise ValueError("Expected an array of field records")
     ids = [str(r.get("field_id", "")) for r in records]
@@ -138,18 +156,21 @@ def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require
     attempts = []
     for attempt in range(retries+1):
         raw = ""
+        diagnostics = {}
         try:
             raw = infer([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}], mode)
+            diagnostics = dict(getattr(infer, "last_diagnostics", {}))
             rows = parse_response(raw, fields, questions, mode, require_evidence=require_evidence)
             if require_evidence and source_text is not None:
                 if any(row["evidence_from_text"].strip() and not quote_spans(source_text, row["evidence_from_text"])
                        for row in rows):
                     raise ValueError("evidence_from_text must be an exact quote from the supplied note")
-            attempts.append(dict(attempt=attempt+1, raw_generation=raw, error=""))
+            attempts.append(dict(attempt=attempt+1, raw_generation=raw, diagnostics=diagnostics, error=""))
             return rows, "", attempts
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            attempts.append(dict(attempt=attempt+1, raw_generation=raw, error=error))
+            diagnostics = dict(getattr(infer, "last_diagnostics", diagnostics))
+            attempts.append(dict(attempt=attempt+1, raw_generation=raw, diagnostics=diagnostics, error=error))
             if isinstance(exc, ContextLimitError):
                 break
             # Keep retries distribution-aligned too: do not append repair instructions.
@@ -226,12 +247,33 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
     return result, attempts
 
 
+def inference_thinking(args, model_name, mode):
+    setting = getattr(args, "thinking", "auto")
+    if setting != "auto":
+        return setting == "on"
+    # This project's SFT formatting does not enable thinking. Match its saved
+    # adapter prompt, while retaining evaluation-mode defaults for base models.
+    if (Path(model_name) / "adapter_config.json").is_file():
+        return False
+    return mode_settings(mode)["thinking"]
+
+
 def make_infer(args, model_name):
     torch, model, processor = load_model(model_name, args.load_in_4bit)
+    # All research inputs are text. The saved SFT template expects a string
+    # system message; wrapping it in multimodal text parts changes that prompt.
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+        if not getattr(tokenizer, "chat_template", None):
+            tokenizer.chat_template = processor.chat_template
+        processor = tokenizer
+    del tokenizer
     def infer(messages, mode):
+        infer.last_diagnostics = {}
+        thinking = inference_thinking(args, model_name, mode)
         encoded = processor.apply_chat_template(format_messages_for_processor(messages, processor),
             tokenize=True, return_dict=True, return_tensors="pt", add_generation_prompt=True,
-            enable_thinking=mode_settings(mode)["thinking"])
+            enable_thinking=thinking)
         text_config = getattr(model.config, "text_config", model.config)
         context_window = min(args.max_seq_length,
                              getattr(text_config, "max_position_embeddings", None) or args.max_seq_length)
@@ -239,8 +281,10 @@ def make_infer(args, model_name):
                              args.max_new_tokens, context_window)
         del encoded
         response, _ = generate(model, processor, torch, messages, args.max_new_tokens,
-                               args.temperature, args.top_p, args.top_k, mode_settings(mode)["thinking"])
+                               args.temperature, args.top_p, args.top_k, thinking,
+                               diagnostics=infer.last_diagnostics)
         return response
+    infer.last_diagnostics = {}
     def cleanup():
         nonlocal model, processor
         model, processor = None, None
@@ -248,6 +292,27 @@ def make_infer(args, model_name):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     return infer, cleanup
+
+
+def resume_requires_cache_reset(previous, current, predictions):
+    """Migrate failed-only runs after a code fix without mixing successful experiments."""
+    if previous["fingerprint"] == current["fingerprint"]:
+        return False
+    if previous["input_hashes"] != current["input_hashes"]:
+        raise ValueError("Resume rejected: input files or question definitions changed; use a new output directory")
+    old_config, new_config = dict(previous["config"]), dict(current["config"])
+    # Older manifests predate explicit thinking settings. Only failed-only runs
+    # can adopt the corrected SFT default; successful outputs must stay isolated.
+    for key in ("thinking", "effective_thinking"):
+        if key not in old_config:
+            new_config.pop(key, None)
+    changed = sorted(k for k in old_config.keys() | new_config.keys() if old_config.get(k) != new_config.get(k))
+    if changed:
+        raise ValueError("Resume rejected: run settings changed (" + ", ".join(changed) + "); use a new output directory")
+    if any(not prediction_failed(row) for row in predictions):
+        raise ValueError("Resume rejected: code or thinking defaults changed and this run contains successful predictions; "
+                         "use a new output directory to keep results comparable")
+    return True
 
 
 def main():
@@ -259,6 +324,8 @@ def main():
     parser.add_argument("--output-dir", "--output_dir", default=str(Path(__file__).parent / "results"))
     parser.add_argument("--models", default="e2b", help="Gemma aliases, Hugging Face IDs, or saved adapter directories (comma-separated)")
     parser.add_argument("--modes", default="baseline")
+    parser.add_argument("--thinking", choices=["auto", "on", "off"], default="auto",
+                        help="auto disables thinking for local SFT adapters and uses mode defaults for base models")
     parser.add_argument("--fields-per-call", "--fields_per_call", type=int, default=5)
     parser.add_argument("--limit", type=int, default=5, help="Encounter limit; 0 means all cohort encounters")
     parser.add_argument("--note-strategy", "--note_strategy", choices=["per_note", "full"], default="per_note")
@@ -273,11 +340,15 @@ def main():
     parser.add_argument("--top-p", "--top_p", type=float, default=0.95)
     parser.add_argument("--top-k", "--top_k", type=int, default=64)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--max-consecutive-failures", "--max_consecutive_failures", type=int, default=3,
+                        help="Stop after this many consecutive failed bundles; 0 disables this guard")
     parser.add_argument("--save-raw-runs", "--save_raw_runs", action="store_true")
     parser.add_argument("--dry-run", "--dry_run", action="store_true")
     parser.add_argument("--save-prompt-preview", "--save_prompt_preview", action="store_true",
                         help="During dry run, also save first encounter's actual note prompts")
     args = parser.parse_args()
+    if args.max_consecutive_failures < 0:
+        parser.error("--max_consecutive_failures must be nonnegative")
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     if not modes or len(modes) != len(set(modes)) or any(m not in DEFAULT_MODES for m in modes):
         parser.error("--modes must contain unique supported prompt modes: " + ", ".join(DEFAULT_MODES))
@@ -307,8 +378,9 @@ def main():
     code = [Path(__file__), Path(__file__).with_name("research_common.py"),
             Path(__file__).with_name("research_eval.py"), ROOT / "prompt_eval/extraction_prompts.py",
             ROOT / "prompt_eval/evaluate_gemma4_extraction.py"]
-    config = {k: v for k, v in vars(args).items() if k not in {"resume", "dry_run", "output_dir", "save_raw_runs", "save_prompt_preview"}}
+    config = {k: v for k, v in vars(args).items() if k not in {"resume", "max_consecutive_failures", "dry_run", "output_dir", "save_raw_runs", "save_prompt_preview"}}
     config["runtime"] = "transformers"
+    config["effective_thinking"] = {model: {mode: inference_thinking(args, model, mode) for mode in modes} for model in models}
     signature = dict(config=config, input_hashes={str(p.resolve()): file_hash(p) for p in inputs},
                      code_hashes={str(p.resolve()): file_hash(p) for p in code})
     fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
@@ -325,16 +397,35 @@ def main():
         old = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (pred_path.exists() or evidence_path.exists()) and not args.resume:
             parser.error("Existing predictions/evidence found: use --resume or a new output directory")
-        if args.resume and old["fingerprint"] != fingerprint:
-            parser.error("Resume rejected: inputs, questions, code, or run configuration changed")
         if args.resume and pred_path.exists():
             predictions = json.loads(pred_path.read_text(encoding="utf-8"))
         if args.resume and evidence_path.exists():
             evidence_cache = json.loads(evidence_path.read_text(encoding="utf-8"))
+        if args.resume:
+            try:
+                reset_cache = resume_requires_cache_reset(old, manifest, predictions)
+            except ValueError as exc:
+                parser.error(str(exc))
+            manifest["resume_history"] = old.get("resume_history", [])
+            if reset_cache:
+                manifest["resume_history"].append({k: old[k] for k in
+                    ("fingerprint", "config", "code_hashes")})
+                evidence_cache = {}
+                # Persist invalidation before the new manifest so interruption
+                # cannot accidentally revive stale evidence on the next resume.
+                if not args.dry_run:
+                    write_json(evidence_path, evidence_cache)
+                print("Resuming a failed-only checkpoint after a code update; cached note reviews will be regenerated.")
+    elif args.resume:
+        parser.error("No run_manifest.json found in --output_dir; pass the original run's output directory")
     elif pred_path.exists() or evidence_path.exists():
         parser.error("Existing predictions/evidence have no run manifest; choose a new output directory")
+    if args.dry_run and args.resume:
+        # A preview must not change the provenance of existing predictions/cache.
+        print("Resume configuration validated; dry run leaves the checkpoint and manifest unchanged")
     write_json(output / "data_audit.json", audit)
-    write_json(manifest_path, manifest)
+    if not (args.dry_run and args.resume):
+        write_json(manifest_path, manifest)
     print(f"Cohort: {len(all_encounters)}; selected: {len(encounters)}; GT matches: {audit['matched_ground_truth']}")
     print(f"Note coverage: {audit['note_coverage']}; date conflicts: {audit['note_date_conflicts']}")
     print(f"All {len(questions)} research fields; bundle sizes: {[len(b) for b in batches]}")
@@ -360,6 +451,10 @@ def main():
         return tuple(str(p[k]) for k in ("model", "mode", "note_strategy", "fields_per_call", "record_id", "field_id"))
     if len({pkey(p) for p in predictions}) != len(predictions):
         raise ValueError("Duplicate checkpoint predictions")
+    skipped_success = completed_bundles = consecutive_failures = 0
+    if args.resume:
+        print(f"Loaded {len(predictions)} saved field results and {len(evidence_cache)} cached note reviews. "
+              "Successful bundles will be skipped; failed and unfinished bundles will be retried.")
     for model_name in models:
         infer = cleanup = None
         try:
@@ -368,8 +463,10 @@ def main():
                     for batch_index, batch in enumerate(batches):
                         wanted = {pkey({**variant, "record_id": encounter["record_id"], "field_id": fid}) for fid in batch}
                         old = [p for p in predictions if pkey(p) in wanted]
-                        if len(old) == len(batch) and all(not prediction_failed(p) for p in old):
-                            continue
+                        if len(old) == len(batch):
+                            if all(not prediction_failed(p) for p in old):
+                                skipped_success += 1
+                                continue
                         if infer is None:
                             infer, cleanup = make_infer(args, model_name)
                         print(f"{model_name} / {variant['mode']}: encounter {encounter_index+1}/{len(encounters)}, bundle {batch_index+1}/{len(batches)}", flush=True)
@@ -380,16 +477,32 @@ def main():
                         predictions = [p for p in predictions if pkey(p) not in wanted]
                         predictions.extend({**r, **variant, "bundle_index": batch_index+1} for r in rows)
                         write_json(pred_path, predictions)
+                        completed_bundles += 1
+                        failures = [a for a in attempts if a.get("error")]
+                        if failures:
+                            with (output / "research_failures.jsonl").open("a", encoding="utf-8") as handle:
+                                handle.write(json.dumps(dict(record_id=encounter["record_id"], **variant,
+                                    fingerprint=fingerprint, fields=batch, attempts=failures), ensure_ascii=False) + "\n")
                         if args.save_raw_runs:
                             with (output / "research_runs.jsonl").open("a", encoding="utf-8") as handle:
                                 handle.write(json.dumps(dict(record_id=encounter["record_id"], **variant,
                                                              fields=batch, attempts=attempts), ensure_ascii=False) + "\n")
+                        if any(prediction_failed(row) for row in rows):
+                            consecutive_failures += 1
+                            print(f"Bundle failed: {rows[0]['parse_error']}. "
+                                  f"Diagnostics: {output / 'research_failures.jsonl'}", flush=True)
+                            if args.max_consecutive_failures and consecutive_failures >= args.max_consecutive_failures:
+                                raise RuntimeError(f"Stopped after {consecutive_failures} consecutive failed bundles. "
+                                    "Checkpoint saved. Inspect research_failures.jsonl before rerunning with --resume.")
+                        else:
+                            consecutive_failures = 0
         finally:
             if cleanup:
                 cleanup()
     completed = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     write_json(output / f"research_{completed}_predictions.json", predictions)
     summaries = evaluate_file(pred_path, gt_path, cohort_path, output, args.questions, manifest_path)
+    print(f"Bundles: processed {completed_bundles}; skipped successful {skipped_success}")
     print(json.dumps(summaries, indent=2))
     print(f"Completed: {output}")
 

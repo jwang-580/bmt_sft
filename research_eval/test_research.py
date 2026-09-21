@@ -421,6 +421,140 @@ class ResearchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "evidence_from_text"):
                 extraction.extract_bundle(lambda *_: "", self.encounters[0], ["R01"], self.questions, mode, "per_note")
 
+    def test_json_wrappers_and_thoughts_preserve_strict_field_validation(self):
+        rows = [dict(field_id="R01", answers="N", evidence_from_text="No CRS")]
+        payload = json.dumps(rows)
+        for raw in (payload, "Here is the result:\n```JSON\n" + payload + "\n```",
+                    "<|channel>thought\nExample [not the answer]<channel|>" + payload + "<turn|>",
+                    json.dumps({"records": rows}), json.dumps(rows[0])):
+            with self.subTest(raw=raw):
+                self.assertEqual(extraction.parse_response(raw, ["R01"], self.questions, "baseline",
+                                                          require_evidence=True), rows)
+        for raw in ("", "There is no output", "<|channel>thought\n" + payload,
+                    payload[:-1], payload + payload, json.dumps(rows * 2), '{"records": []}'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                extraction.parse_response(raw, ["R01"], self.questions, "baseline")
+        with self.assertRaises(ValueError):
+            extraction.parse_response(payload, ["R01", "R02"], self.questions, "baseline")
+
+    def test_generation_preserves_decoded_json_and_reports_empty_thought_output(self):
+        from prompt_eval import evaluate_gemma4_extraction as gemma
+        processor = SimpleNamespace(apply_chat_template=Mock(return_value={"input_ids": SimpleNamespace(shape=(1, 2))}),
+                                    decode=Mock(), parse_response=Mock(return_value={"content": ""}))
+        model = SimpleNamespace(generate=Mock(return_value=[[1, 2, 3, 4, 5]]))
+        torch = SimpleNamespace(inference_mode=contextlib.nullcontext)
+        payload = '[{"field_id":"R01","answers":"N"}]'
+        for raw, expected in ((payload + "<turn|>", payload),
+                              ("<|channel>thought\nreview<channel|>" + payload, payload),
+                              ("<|channel>thought\nunfinished " + payload, ""), ("<turn|>", "")):
+            diagnostics = {}
+            processor.decode.return_value = raw
+            result, _ = gemma.generate(model, processor, torch, [], 3, 0, .95, 64, False, diagnostics=diagnostics)
+            self.assertEqual(result, expected)
+            self.assertEqual(diagnostics["raw_decoded"], raw)
+            self.assertEqual(diagnostics["generated_tokens"], 3)
+            self.assertTrue(diagnostics["reached_token_limit"])
+
+    def test_local_adapter_uses_plain_tokenizer_and_training_thinking_default(self):
+        adapter = self.path / "adapter"
+        adapter.mkdir()
+        (adapter / "adapter_config.json").write_text("{}")
+        args = SimpleNamespace(thinking="auto", load_in_4bit=False, max_seq_length=100,
+                               max_input_tokens=80, max_new_tokens=10, temperature=0, top_p=.95, top_k=64)
+        tokenizer = SimpleNamespace(chat_template=None,
+            apply_chat_template=Mock(return_value={"input_ids": SimpleNamespace(shape=(1, 20))}))
+        processor = SimpleNamespace(tokenizer=tokenizer, chat_template="saved SFT template")
+        model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=100))
+        messages = [{"role": "system", "content": "plain system"}, {"role": "user", "content": "plain note"}]
+        with patch.object(extraction, "load_model", return_value=(Mock(), model, processor)), \
+             patch.object(extraction, "generate", return_value=("[]", "")) as generate:
+            infer, cleanup = extraction.make_infer(args, str(adapter))
+            infer(messages, "baseline")
+            self.assertEqual(tokenizer.chat_template, "saved SFT template")
+            self.assertEqual(tokenizer.apply_chat_template.call_args.args[0], messages)
+            self.assertFalse(tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"])
+            self.assertIs(generate.call_args.args[1], tokenizer)
+            self.assertFalse(generate.call_args.args[-1])
+            cleanup()
+        self.assertTrue(extraction.inference_thinking(args, "google/base", "baseline"))
+        args.thinking = "on"
+        self.assertTrue(extraction.inference_thinking(args, str(adapter), "baseline"))
+
+    def test_saved_chat_template_matches_training_prefix(self):
+        try:
+            import jinja2
+        except ImportError:
+            self.skipTest("Optional Jinja verification unavailable")
+        template_path = Path(__file__).resolve().parents[1] / "fine_tuning/outputs/gemma4_12b_lora/final/chat_template.jinja"
+        if not template_path.exists():
+            self.skipTest("Saved trained adapter is not available")
+        template = jinja2.Environment().from_string(template_path.read_text(encoding="utf-8"))
+        messages = [{"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": "Synthetic note and questions"}]
+        training = template.render(messages=messages + [{"role": "assistant", "content": "[]"}],
+                                   bos_token="<bos>", add_generation_prompt=False)
+        inference = template.render(messages=messages, bos_token="<bos>", add_generation_prompt=True,
+                                    enable_thinking=False)
+        self.assertTrue(training.startswith(inference))
+        self.assertNotIn("<|think|>", inference)
+        self.assertNotIn("'type': 'text'", inference)
+
+    def test_resume_retries_failures_and_pending_work_while_skipping_successes(self):
+        output = self.path / "resume_failed"
+        argv = ["research_extract.py", "--data_dir", str(self.path), "--output_dir", str(output),
+                "--limit", "1", "--note_strategy", "full", "--parse_retries", "0", "--max_consecutive_failures", "1"]
+        calls = []
+        def good(messages, mode):
+            fields = re.findall(r"^Field (R\d+)$", messages[-1]["content"], flags=re.M)
+            calls.append(fields)
+            return json.dumps([dict(field_id=f, answers="N/A") for f in fields])
+        def fail_second(messages, mode):
+            if len(calls) == 1:
+                return "Invalid generation"
+            return good(messages, mode)
+        with patch("sys.argv", argv), patch.object(extraction, "make_infer", return_value=(fail_second, lambda: None)), \
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "Checkpoint saved"):
+            extraction.main()
+        saved = json.loads((output / "research_predictions.json").read_text())
+        self.assertEqual(len(saved), 10)
+        failure = json.loads((output / "research_failures.jsonl").read_text())
+        self.assertEqual(failure["attempts"][0]["raw_generation"], "Invalid generation")
+        self.assertFalse((output / "research_runs.jsonl").exists())
+        calls.clear()
+        with patch("sys.argv", argv + ["--resume"]), \
+             patch.object(extraction, "make_infer", return_value=(good, lambda: None)), contextlib.redirect_stdout(io.StringIO()):
+            extraction.main()
+        self.assertEqual(calls, [["R06", "R07", "R08", "R09", "R10"], ["R11", "R12", "R13", "R14"]])
+        calls.clear()
+        with patch("sys.argv", argv + ["--resume"]), \
+             patch.object(extraction, "make_infer") as loader, contextlib.redirect_stdout(io.StringIO()):
+            extraction.main()
+        loader.assert_not_called()
+        saved = json.loads((output / "research_predictions.json").read_text())
+        self.assertEqual(len(saved), 14)
+        self.assertTrue(all(p["extraction_success"] for p in saved))
+
+    def test_failed_only_legacy_resume_migration_and_provenance_checks(self):
+        current = dict(fingerprint="new", input_hashes={"notes": "hash"}, code_hashes={"script": "new"},
+                       config=dict(models="model", thinking="auto", effective_thinking={"model": {"baseline": False}}))
+        old = dict(fingerprint="old", input_hashes={"notes": "hash"}, code_hashes={"script": "old"}, config=dict(models="model"))
+        failed = [dict(extraction_success=False, parse_error="JSONDecodeError", answers="N/A")]
+        self.assertTrue(extraction.resume_requires_cache_reset(old, current, failed))
+        self.assertFalse(extraction.resume_requires_cache_reset(current, current, failed))
+        with self.assertRaisesRegex(ValueError, "successful predictions"):
+            extraction.resume_requires_cache_reset(old, current, [dict(extraction_success=True)])
+        with self.assertRaisesRegex(ValueError, "input files"):
+            extraction.resume_requires_cache_reset({**old, "input_hashes": {"notes": "changed"}}, current, failed)
+        with self.assertRaisesRegex(ValueError, "models"):
+            extraction.resume_requires_cache_reset({**old, "config": {"models": "other"}}, current, failed)
+
+    def test_resume_missing_directory_fails_instead_of_starting_new_run(self):
+        argv = ["research_extract.py", "--data_dir", str(self.path), "--output_dir", str(self.path / "missing"), "--resume"]
+        with patch("sys.argv", argv), patch.object(extraction, "load_model") as loader, \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            extraction.main()
+        loader.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

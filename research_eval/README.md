@@ -143,8 +143,9 @@ Inference uses the **Transformers** loader and generation functions from
 `prompt_eval/evaluate_gemma4_extraction.py`. Install PyTorch, Transformers, and
 Accelerate in the inference environment; 4-bit loading also needs bitsandbytes,
 and saved LoRA adapters need PEFT. Unsloth is not required for research inference.
-The processor's saved chat template is used; baseline extraction prompts remain
-identical to the SFT template.
+Text-only inference uses the saved tokenizer and chat template, keeping system
+and user messages as plain strings as in SFT. Baseline extraction instructions
+remain identical to the SFT template.
 Gemma aliases, Hugging Face model names, and saved fine-tuned adapter directories
 are accepted. `--load_in_4bit` is optional. Data preparation and scoring use only
 the Python standard library.
@@ -163,7 +164,10 @@ Useful options:
 - `--modes baseline,no_reasoning`: run multiple prompt variants.
   Keep `baseline` alone for the exact SFT prompt. Other modes, including few-shot
   examples, use the shared Gemma evaluation variants without research-specific rewrites.
-  Gemma's internal thinking is switched with the prompt mode, as in the shared evaluator.
+- `--thinking auto`: default; disables internal thinking for local adapter folders
+  containing `adapter_config.json`, matching this project's training format.
+  Base models use the shared evaluator's mode defaults. `--thinking on` and
+  `--thinking off` explicitly override this without changing question instructions.
 - `--note_strategy per_note`: default; independent complete-note reviews with standard
   evidence quotes, then a final extraction call for each question bundle. Intermediate
   reviews use at most five relevant questions. Arbitrary text splitting is removed.
@@ -179,11 +183,20 @@ Useful options:
   This does not extend the model's supported context length.
 - `--max_new_tokens 8192`: generation allowance. The input budget applies to final evidence as well as original notes;
   an unusually large evidence collection fails rather than being silently trimmed.
-- `--resume`: rerun the same command with this flag. Complete successful bundles are
-  skipped; failed bundles reuse successful note reviews and retry failed work. Changed inputs, question definitions, runtime
-  wrapper code, or generation settings reject resume. Use a new output directory
-  for a changed experiment. A dry run can be followed by a real run in its directory.
-- `--save_raw_runs`: opt-in raw model responses. These contain clinical text.
+- `--resume`: rerun the same command with this flag and the original output directory.
+  Retry failed and unfinished bundles, reusing valid cached note reviews; skip
+  complete successful bundles. The startup summary reports loaded results.
+  A missing manifest is an error rather than silently starting from encounter 1.
+  Starting at encounter 1 is expected if its first bundle failed.
+  Changed inputs or generation settings reject resume. After a code fix, a run
+  containing only failed predictions can resume with its old note cache cleared;
+  the previous configuration is retained in the manifest's resume history. Runs
+  containing successful predictions require a new output directory after a code
+  change, so results from different implementations are not mixed.
+- `--max_consecutive_failures 3`: stop after three consecutive failed bundles,
+  retaining checkpoints and diagnostics. Set to `0` to disable the guard.
+- `--save_raw_runs`: save all attempts, including successes. Failed attempts are
+  always saved in `research_failures.jsonl`; both logs can contain clinical text.
 - `--save_prompt_preview`: with `--dry_run`, save the first encounter's actual
   per-note prompts. By default a dry run writes only the audit and run manifest.
 - `--data_dir`, `--cohort`, `--ground_truth`, `--questions`: override inputs explicitly.
@@ -202,6 +215,9 @@ Useful options:
   final clinical-note input, not the cached answer values.
 - `research_predictions.json`: atomic checkpoint, one record per encounter/field/variant;
   carries standard answer/evidence/rationale metadata plus research source coverage.
+- `research_failures.jsonl`: failed attempts with stage, source, raw answer text,
+  original decoded output, input/output token counts, thinking setting, and token-limit
+  status when generation completed. This is written even without `--save_raw_runs`.
 - `research_<UTC timestamp>_predictions.json`: final prediction snapshot.
 - `research_evaluation_summary.json`, `research_evaluation_overall_metrics.csv`,
   `research_evaluation_field_metrics.csv`, `research_evaluation_details.csv`: overall,
@@ -212,6 +228,23 @@ Score a saved result without loading a model:
 ```powershell
 python research_eval/research_eval.py --predictions research_eval/results/gemma_e2b/research_predictions.json
 ```
+
+### Recovering the all-N/A parsing-failure run
+
+`answers: "N/A"` together with `extraction_success: false` is a failure placeholder,
+not a clinical finding. Update both `research_extract.py` and the shared
+`prompt_eval/evaluate_gemma4_extraction.py`, then retry failed bundles:
+
+```powershell
+python research_eval/research_extract.py --models fine_tuning/outputs/gemma4_12b_lora/final --limit 0 --output_dir research_eval/results/gemma_finetuned --resume
+```
+
+The parser accepts a complete JSON array inside Markdown/prose or a standard
+response wrapper, and a single record for a one-question call. It still rejects
+truncated JSON, duplicate/missing field IDs, invalid values, and unsupported quotes.
+Empty final output is reported explicitly; unfinished thought text is never used
+as a clinical answer. If failures persist, inspect the last failed attempt in
+`research_failures.jsonl`; the prediction file alone cannot show what the model generated.
 
 The evaluator detects the adjacent run manifest and evaluates **every expected
 encounter and field in that run**, including missing/failed predictions and entire

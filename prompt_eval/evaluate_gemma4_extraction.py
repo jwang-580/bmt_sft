@@ -697,7 +697,8 @@ def processor_text(response):
         for key in ("answer", "content", "text", "response"):
             if key in response:
                 return processor_text(response[key])
-        return json.dumps(response, ensure_ascii=False)
+        # Metadata/thinking alone is not an answer.
+        return ""
     if isinstance(response, (list, tuple)):
         return "\n".join(processor_text(item) for item in response if processor_text(item))
     return str(response)
@@ -712,6 +713,20 @@ def extract_thought(response):
     if end_match:
         thought = thought[: end_match.start()]
     return thought.strip()
+
+
+def final_answer_text(response):
+    """Remove Gemma turn/thought wrappers without treating unfinished thought as an answer."""
+    text = response.strip().removeprefix("<bos>").strip()
+    text = re.sub(r"^<\|turn>model\s*", "", text)
+    while text.startswith("<|channel>thought"):
+        end = text.find("<channel|>")
+        if end < 0:
+            return ""
+        text = text[end + len("<channel|>"):].strip()
+    text = re.sub(r"^<\|channel>(?:final|answer)\s*", "", text)
+    text = re.split(r"<turn\|>|<\|end\|>|<eos>", text, maxsplit=1)[0]
+    return text.strip()
 
 
 def _is_multimodal_processor(processor):
@@ -735,7 +750,8 @@ def format_messages_for_processor(messages, processor):
     return formatted
 
 
-def generate(model, processor, torch, messages, max_new_tokens, temperature, top_p, top_k, enable_thinking):
+def generate(model, processor, torch, messages, max_new_tokens, temperature, top_p, top_k, enable_thinking,
+             *, diagnostics=None):
     messages = format_messages_for_processor(messages, processor)
     inputs = processor.apply_chat_template(
         messages,
@@ -764,12 +780,25 @@ def generate(model, processor, torch, messages, max_new_tokens, temperature, top
     input_len = inputs["input_ids"].shape[-1]
     response = processor.decode(output_ids[0][input_len:], skip_special_tokens=False)
     thought = extract_thought(response)
+    if diagnostics is not None:
+        diagnostics.update(raw_decoded=response, input_tokens=input_len,
+                           generated_tokens=len(output_ids[0][input_len:]),
+                           reached_token_limit=len(output_ids[0][input_len:]) >= max_new_tokens,
+                           enable_thinking=enable_thinking)
+    decoded_answer = final_answer_text(response)
+    # Saved SFT tokenizers can have a response schema that returns empty content
+    # for an otherwise valid generation. Preserve the actual decoded answer.
+    if decoded_answer.startswith(("[", "{", "```")):
+        return decoded_answer, thought
     if hasattr(processor, "parse_response"):
         try:
-            return processor_text(processor.parse_response(response)).strip(), thought
-        except Exception:
-            pass
-    return processor.decode(output_ids[0][input_len:], skip_special_tokens=True).strip(), thought
+            parsed_answer = final_answer_text(processor_text(processor.parse_response(response)))
+            if parsed_answer and decoded_answer:
+                return parsed_answer, thought
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics["processor_parse_error"] = f"{type(exc).__name__}: {exc}"
+    return decoded_answer, thought
 
 
 def generate_predictions(
