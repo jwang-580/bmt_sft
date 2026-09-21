@@ -25,7 +25,7 @@ from prompt_eval.evaluate_gemma4_extraction import (generate, load_model, resolv
     format_messages_for_processor, final_answer_text)
 from prompt_eval.extraction_prompts import (DEFAULT_MODES, EXTRACTION_SYSTEM_PROMPT,
     build_user_prompt, mode_settings)
-from research_eval.research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, ROOT,
+from research_eval.research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, ROOT, DATE_FIELDS,
     data_audit, file_hash, load_encounters, load_questions, normalize_value,
     render_note, select_notes, write_json)
 from research_eval.research_eval import evaluate_file, prediction_failed
@@ -59,12 +59,20 @@ def clinical_note_text(encounter, text):
 
 
 def build_prompt(encounter, fields, questions, mode, *, note_text=None, note_date=None):
-    """Use the canonical evaluation/SFT builder with no stage-specific instructions."""
+    """Keep the shared layout; defer research missing-answer wording to the questions."""
     if note_text is None:
         note_text = "\n\n".join(map(render_note, select_notes(encounter, fields, questions)))
     note = dict(record_id=encounter["record_id"], record_id_type=encounter["record_id_type"],
                 date=note_date or encounter["date"], note=clinical_note_text(encounter, note_text))
-    return build_user_prompt(note, fields, questions, mode)
+    prompt = build_user_prompt(note, fields, questions, mode)
+    # Research now distinguishes absence of documentation from non-applicability.
+    # Do not change the shared SFT builder or leave a conflicting generic N/A rule.
+    for conjunction in ("when", "if"):
+        prompt = prompt.replace(f'Use "N/A" {conjunction} the answer is not found.',
+                                'Use "not mentioned" when the requested fact is not documented; use "N/A" only as allowed by the field instructions.')
+    prompt = prompt.replace('a concise quote or paraphrase from the note. Use "" for N/A answers.',
+                            'a concise exact supporting quote from the note. Use "" for not mentioned answers.')
+    return prompt.replace('still include the line and use N/A.', 'still include the line and use not mentioned.')
 
 
 def quote_spans(source_text, quote):
@@ -76,7 +84,7 @@ def quote_spans(source_text, quote):
 
 
 def collect_excerpts(note, rows):
-    """Select whole sentences/paragraphs containing verified quotes; retain negation/dates.
+    """Select whole sentences/paragraphs containing source-matched quotes; retain negation/dates.
 
     The model reads the entire original note. This is evidence selection afterward,
     not a text-splitting strategy. If a source has no sentence boundaries, its full
@@ -86,6 +94,8 @@ def collect_excerpts(note, rows):
     boundaries = sorted({0, len(text), *(m.end() for m in re.finditer(r"(?<=[.!?])\s+|\n\s*\n", text))})
     spans = []
     for row in rows:
+        if str(row.get("answers", "")).strip().lower() == "not mentioned":
+            continue
         for start, end in quote_spans(text, row.get("evidence_from_text", "")):
             left = boundaries[max(0, bisect_right(boundaries, start)-1)]
             right = boundaries[min(len(boundaries)-1, bisect_left(boundaries, end))]
@@ -153,6 +163,8 @@ def parse_response(text, fields, questions, mode, *, require_evidence=False):
 
 
 def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require_evidence=False, source_text=None):
+    if require_evidence and source_text is None:
+        raise ValueError("Quote validation requires the supplied source text")
     attempts = []
     for attempt in range(retries+1):
         raw = ""
@@ -162,14 +174,29 @@ def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require
             diagnostics = dict(getattr(infer, "last_diagnostics", {}))
             rows = parse_response(raw, fields, questions, mode, require_evidence=require_evidence)
             if require_evidence and source_text is not None:
-                if any(row["evidence_from_text"].strip() and not quote_spans(source_text, row["evidence_from_text"])
-                       for row in rows):
-                    raise ValueError("evidence_from_text must be an exact quote from the supplied note")
+                for row in rows:
+                    quote = row["evidence_from_text"].strip()
+                    target = questions[row["field_id"]]["target_column"]
+                    _, status = normalize_value(target, row["answers"])
+                    if status == "not_mentioned" or (status == "empty" and not quote):
+                        if quote:
+                            raise ValueError("not mentioned requires an empty evidence_from_text")
+                        row.update(answers="not mentioned", evidence_from_text="")
+                    else:
+                        if not quote:
+                            raise ValueError(f"{row['field_id']}: an extracted answer requires a supporting quote")
+                        if not quote_spans(source_text, quote):
+                            raise ValueError("evidence_from_text must be an exact quote from the supplied note")
+                        if status == "empty":
+                            if target not in DATE_FIELDS | {"max_temp"}:
+                                raise ValueError(f"{row['field_id']}: use not mentioned with an empty quote for missing information")
+                            row["answers"] = "N/A"
             attempts.append(dict(attempt=attempt+1, raw_generation=raw, diagnostics=diagnostics, error=""))
             return rows, "", attempts
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            diagnostics = dict(getattr(infer, "last_diagnostics", diagnostics))
+            if not diagnostics:
+                diagnostics = dict(getattr(infer, "last_diagnostics", {}))
             attempts.append(dict(attempt=attempt+1, raw_generation=raw, diagnostics=diagnostics, error=error))
             if isinstance(exc, ContextLimitError):
                 break
@@ -187,8 +214,8 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
                    evidence_cache=None, cache_scope="", save_cache=None):
     if strategy not in {"per_note", "full"}:
         raise ValueError("Supported note strategies are per_note and full; notes are never split")
-    if strategy == "per_note" and "evidence_from_text" not in mode_settings(mode)["extra_fields"]:
-        raise ValueError("Per-note review requires a prompt mode with evidence_from_text; use baseline for SFT alignment")
+    if "evidence_from_text" not in mode_settings(mode)["extra_fields"]:
+        raise ValueError("Research extraction requires evidence_from_text; use baseline for the SFT layout")
     notes = select_notes(encounter, fields, questions)
     attempts = []
     rows, error = [], "No matching notes for this bundle" if not notes else ""
@@ -202,7 +229,7 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
                 log = [dict(attempt=0, cached=True, error="")]
             else:
                 note_rows, error, log = request_bundle(infer, prompt, relevant, questions, mode, retries,
-                                                     require_evidence=True, source_text=note["text"])
+                    require_evidence=True, source_text=note["text"])
                 if not error:
                     # Cache standard response fields. No model-inferred answers or
                     # rationales are inserted into the final clinical-note content.
@@ -224,11 +251,12 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
             evidence_text = render_evidence_notes(findings)
             prompt = build_prompt(encounter, fields, questions, mode, note_text=evidence_text)
             rows, error, log = request_bundle(infer, prompt, fields, questions, mode, retries,
-                                             require_evidence=True, source_text=evidence_text)
+                require_evidence=True, source_text=evidence_text)
             attempts.extend(dict(stage="final", **a) for a in log)
     elif notes:
         prompt = build_prompt(encounter, fields, questions, mode)
-        rows, error, log = request_bundle(infer, prompt, fields, questions, mode, retries)
+        rows, error, log = request_bundle(infer, prompt, fields, questions, mode, retries,
+            require_evidence=True, source_text="\n\n".join(map(render_note, notes)))
         attempts.extend(dict(stage="full", **a) for a in log)
     by_id = {r["field_id"]: r for r in rows}
     result = []
@@ -237,7 +265,7 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
         raw = by_id.get(fid, {})
         prediction = {k: encounter[k] for k in ("record_id", "record_id_type", "date", "MRN", "bmt_date")}
         prediction.update({k: q[k] for k in ("field_id", "field_category", "field_name", "field_instructions", "target_column")})
-        prediction.update(answers=raw.get("answers", "N/A"), extraction_success=not bool(error),
+        prediction.update(answers=raw.get("answers"), extraction_success=not bool(error),
                           parse_error=error, note_sources=q["note_sources"],
                           available_note_counts=dict(Counter(n["source"] for n in notes)),
                           missing_note_sources=[s for s in q["note_sources"] if not any(n["source"] == s for n in notes)])
@@ -352,8 +380,8 @@ def main():
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     if not modes or len(modes) != len(set(modes)) or any(m not in DEFAULT_MODES for m in modes):
         parser.error("--modes must contain unique supported prompt modes: " + ", ".join(DEFAULT_MODES))
-    if args.note_strategy == "per_note" and any("evidence_from_text" not in mode_settings(m)["extra_fields"] for m in modes):
-        parser.error("per_note requires evidence_from_text; use baseline for SFT alignment or explicitly select full for modes without evidence")
+    if any("evidence_from_text" not in mode_settings(m)["extra_fields"] for m in modes):
+        parser.error("Research extraction requires evidence_from_text in every mode; use baseline for the SFT layout")
     if args.limit < 0 or args.fields_per_call <= 0 or args.parse_retries < 0 or args.max_new_tokens <= 0:
         parser.error("Invalid limit, bundle size, retry count, or generation length")
     if args.max_input_tokens <= 0 or args.max_seq_length <= args.max_new_tokens:
@@ -386,7 +414,7 @@ def main():
     fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     manifest = dict(fingerprint=fingerprint, **signature, record_ids=[e["record_id"] for e in encounters],
                     variants=variants, bundles=batches, dry_run=args.dry_run,
-                    prompt_contract="shared_sft_baseline" if modes == ["baseline"] else "shared_evaluation_variants")
+                    prompt_contract="research_question_instructions_v2")
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     manifest_path, pred_path = output / "run_manifest.json", output / "research_predictions.json"
@@ -444,7 +472,10 @@ def main():
                             prompt=build_prompt(encounters[0], batch, questions, mode)))
             write_json(output / "prompt_preview.json", previews)
         note_calls = sum(1 for e in encounters for batch in batches for _ in note_jobs(e, batch, questions))
-        print(f"Strategy: {args.note_strategy}; planned per-note calls: {note_calls * len(variants) if args.note_strategy == 'per_note' else 0}; final bundle calls: {len(encounters)*len(batches)*len(variants)}")
+        planned_note_calls = note_calls * len(variants) if args.note_strategy == 'per_note' else 0
+        planned_final_calls = len(encounters)*len(batches)*len(variants)
+        print(f"Strategy: {args.note_strategy}; planned per-note extraction calls: {planned_note_calls}; "
+              f"final bundle extraction calls: {planned_final_calls} (before retries/cache reuse)")
         print(f"Dry run complete: {output}; no model loaded and no predictions scored")
         return
     def pkey(p):

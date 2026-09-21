@@ -38,38 +38,58 @@ There is no invented fifteenth question or duplicated padding question.
 
 | Bundle | Questions | Source selection |
 | --- | --- | --- |
-| 1 | CRS, first/last fever dates, maximum temperature, hypotension | Progress and discharge; H&P added for hypotension baseline |
+| 1 | CRS, first/last fever dates, maximum temperature, hypotension | Progress and discharge |
 | 2 | Vasopressor count, hypoxia, high-flow oxygen, BiPAP/intubation, neurotoxicity | Progress, discharge, H&P baseline |
 | 3 | Tocilizumab use, first/last administration dates, total dose count | Progress and discharge |
 
 The default `per_note` workflow reviews each complete source note independently.
 It never combines multiple original notes in one extraction call or splits a note.
 Within each bundle, a source receives only its relevant questions: for example,
-H&P receives R05 from bundle 1, R06–R10 from bundle 2, and none from bundle 3.
+H&P receives R06–R10 from bundle 2 and none from bundles 1 or 3. R05 is assessed
+from progress notes and discharge summaries, not the admission H&P.
 
-Each review returns the standard SFT answer records, including `answers`,
-`evidence_from_text`, and `reasoning_trace`. There is no custom `events` schema.
-Code verifies each nonempty quote against the original note and retrieves its
-containing source sentence/paragraph, preserving negation and dates in that
-passage. Duplicate or overlapping excerpts within a note are merged. If the same
-quote occurs in multiple passages, all matching passages remain available.
+Each extraction returns the standard SFT answer records, including `answers`,
+`evidence_from_text`, and `reasoning_trace`. Each question's **Options / Instructions**
+specifies what supports its answer, which misleading observations to exclude, and
+how to handle missing information. There is one extraction call per note/bundle
+and one final extraction per bundle, with no judge or additional validation call.
+
+| Information in the source | Requested answer | Requested quote |
+| --- | --- | --- |
+| Documented value or event | Value / `Y` | Exact quote supporting this specific field |
+| Explicit absence/non-use | `N` / zero | Exact statement of absence/non-use |
+| Explicit non-applicability of a date/temperature | `N/A`, e.g. fever date when no fever occurred | Statement establishing non-applicability |
+| Requested fact is not documented | `not mentioned` | Empty string |
+
+Missing dates/counts can be `not mentioned` even when the underlying event is
+described. For example, R05 explicitly says that 'no fevers', transplant day, and
+'no transplant reactions' do not establish CRS-associated hypotension or its absence.
+The extraction model makes this semantic decision using the question instructions.
+Code checks exact quote membership, requires quotes for extracted values, and
+requires an empty quote for `not mentioned`. Legacy empty `N/A` responses are
+normalized to `not mentioned`. Failed format/quote checks retry the extraction;
+unresolved failures use `answers: null` and `extraction_success: false`.
+
+These checks do not independently prove that an exact quote supports an answer;
+clinical relevance remains the extraction model's responsibility and needs accuracy
+evaluation. Source-matched quotes contribute their enclosing sentences/paragraphs
+to the final pass, preserving negation and dates. Overlapping passages are merged.
 
 The final call receives these **verbatim source excerpts**, labeled with their
 source and note dates, as its `Clinical note`. Intermediate model answers and
 rationales are not inserted as clinical facts. The final model answers the same
 5/5/4 question bundles using the standard extraction prompt and the research field
-instructions. H&P supplies baseline context; discharge supplies the wider course.
+instructions. H&P supplies baseline context for bundle 2; discharge supplies the wider course.
 
-Empty evidence strings are valid under the training format and contribute no
-excerpts. A missing quote is not converted into a negative clinical finding.
-Successful note reviews are saved immediately and reused on resume; failed reviews
-fail the bundle. This uses more calls than concatenating the admission, but keeps
+`not mentioned` contributes no excerpts and is never converted into a negative
+clinical finding. Final-stage `not mentioned` is scoped to the selected excerpts,
+not a claim about unreviewed chart content. Successful note extractions are saved
+immediately and reused on resume; failed extractions fail the bundle. The workflow keeps
 each original note intact in the first pass. A long enclosing passage remains
 subject to the input limit instead of being truncated. Events not represented by
 first-pass quotes can be missed in the final pass; this needs accuracy evaluation.
 
-The supplied data has a median combined bundle-1 note length of 76,651 characters
-and a maximum of 311,777. Individual progress notes have a median of 7,522 characters;
+Individual progress notes have a median of 7,522 characters;
 the largest discharge summary is 62,493 characters. These are text lengths, not
 token counts. Some individual notes can still be too large for a small context.
 No clinical label columns or per-patient research annotation comments are included
@@ -85,15 +105,18 @@ which calls `build_sft_user_prompt`. The saved conversations in
 - The **system message is identical**: the imported `EXTRACTION_SYSTEM_PROMPT`.
   Its existing Form 2400 wording is retained to match training; research questions
   and answer options still come from `research_questions.csv`.
-- The **user-message template, question layout, fixed rules, and ten output keys
-  are identical** to SFT. Only variable record metadata, clinical text, and research
-  question definitions change. The record identifier correctly remains MRN+BMT date.
+- The **question layout and ten output keys** retain the SFT structure. Research
+  question definitions supply the field-specific evidence rules. In research prompts
+  only, the generic missing-answer line uses `not mentioned`, reserving `N/A` for
+  field-defined non-applicability. The shared training template and training data
+  are unchanged. The record identifier remains MRN+BMT date.
 - The first pass supplies one complete note. Code prepares selected source excerpts
   for the final pass. Neither pass adds special review, summarization, synthesis,
-  or event-output instructions. Retries reuse the same messages without a repair suffix.
+  or event-output instructions to the extraction prompt. Retries reuse the same
+  extraction messages without a repair suffix.
 - Study rules live in each question's existing `Options / Instructions` slot.
-- Other prompt modes are explicit experiments, not the training prompt. The
-  shared evaluation variants are reused as-is; they are not silently activated.
+- Other prompt modes are explicit experiments. Their research missing-answer and
+  quote wording follows the same rules; they are not silently activated.
 
 Prompt/template alignment does not establish equal clinical performance: research
 fields and excerpt-based inputs differ from the training data. No fine-tuned model
@@ -162,8 +185,9 @@ Useful options:
 - `--limit 0`: all 191 cohort encounters. The default is 5 encounters.
 - `--fields_per_call 5`: five questions per call; the last bundle has four.
 - `--modes baseline,no_reasoning`: run multiple prompt variants.
-  Keep `baseline` alone for the exact SFT prompt. Other modes, including few-shot
-  examples, use the shared Gemma evaluation variants without research-specific rewrites.
+  Keep `baseline` alone for the SFT layout with research question instructions.
+  Other modes, including few-shot examples, use the shared Gemma evaluation variants
+  with the research missing-answer and exact-quote wording.
 - `--thinking auto`: default; disables internal thinking for local adapter folders
   containing `adapter_config.json`, matching this project's training format.
   Base models use the shared evaluator's mode defaults. `--thinking on` and
@@ -172,8 +196,8 @@ Useful options:
   evidence quotes, then a final extraction call for each question bundle. Intermediate
   reviews use at most five relevant questions. Arbitrary text splitting is removed.
 - `--note_strategy full`: explicitly opt into the older combined-notes comparison.
-  `non_json` and `no_evidence_field` require `full`; per-note review needs the
-  standard `evidence_from_text` output field to select source excerpts.
+  The same question instructions and quote checks apply. `non_json` and
+  `no_evidence_field` are rejected because research extraction requires quotes.
 - `--parse_retries 1`: retry malformed, incomplete, invalid-valued, or failed responses.
 - `--max_input_tokens 24000`: check every note and final evidence input before generation.
   Uses the actual chat-template token count and reserves output space within both
@@ -210,7 +234,7 @@ Useful options:
 - `prompt_preview.json`: optional first-encounter prompts, with one intact note per
   evidence call under `per_note`; never a fabricated inference result.
 - `note_evidence.json`: standard field IDs, answers, and evidence quotes saved after
-  each successful review with encounter/source/date/model/mode metadata. Reusable
+  each successful extraction, with encounter/source/date/model/mode metadata. Reusable
   during resume; only original source passages selected by the quotes enter the
   final clinical-note input, not the cached answer values.
 - `research_predictions.json`: atomic checkpoint, one record per encounter/field/variant;
@@ -231,17 +255,20 @@ python research_eval/research_eval.py --predictions research_eval/results/gemma_
 
 ### Recovering the all-N/A parsing-failure run
 
-`answers: "N/A"` together with `extraction_success: false` is a failure placeholder,
-not a clinical finding. Update both `research_extract.py` and the shared
-`prompt_eval/evaluate_gemma4_extraction.py`, then retry failed bundles:
+In older results, `answers: "N/A"` together with `extraction_success: false` is a
+failure placeholder, not a clinical finding. New failures use `answers: null`.
+The updated question instructions change the run contract: start a **new output
+directory** so results from previous prompts are not reused:
 
 ```powershell
-python research_eval/research_extract.py --models fine_tuning/outputs/gemma4_12b_lora/final --limit 0 --output_dir research_eval/results/gemma_finetuned --resume
+python research_eval/research_extract.py --models fine_tuning/outputs/gemma4_12b_lora/final --limit 0 --output_dir research_eval/results/gemma_finetuned_questions_v2
 ```
+
+Subsequent restarts of this new run use the same command with `--resume`.
 
 The parser accepts a complete JSON array inside Markdown/prose or a standard
 response wrapper, and a single record for a one-question call. It still rejects
-truncated JSON, duplicate/missing field IDs, invalid values, and unsupported quotes.
+truncated JSON, duplicate/missing field IDs, invalid values, and quotes absent from the source.
 Empty final output is reported explicitly; unfinished thought text is never used
 as a clinical answer. If failures persist, inspect the last failed attempt in
 `research_failures.jsonl`; the prediction file alone cannot show what the model generated.
@@ -267,6 +294,9 @@ Scoring rules:
 - Missing/failed/invalid predictions count as wrong for scorable GT. A successfully
   returned N/A only matches an applicable empty target. Blank temperature GT is
   **not** a wildcard accepting any predicted temperature.
+- `not mentioned` is a separate abstention, reported as `not_mentioned_predictions`.
+  It counts as incorrect for scorable GT and does not match a negative, zero, or
+  not-applicable GT value. It is not counted as a parsing failure.
 - Report exact accuracy separately from tolerance accuracy (default ±1 day and
   ±0.1 F). Counts require exact matches. MAE uses paired valid values and reports
   the paired denominator. Missing values still lower overall accuracy.
@@ -282,8 +312,9 @@ python -m unittest research_eval.test_research -v
 
 Tests use synthetic notes and mocked inference to check encounter isolation,
 source routing, no GT leakage, date conflicts, duplicate handling, strict output
-validation, quote checking, input limits, retry prompt stability, exact SFT template
-equality in both passes, source-excerpt selection, missing-answer penalties, tolerances,
+validation, quote checking, input limits, retry prompt stability, SFT layout with
+research-specific missing-answer wording in both passes, single-call extraction,
+source-excerpt selection, missing-answer penalties, tolerances,
 legacy CSV input, full extraction-to-scoring execution, and resume protection.
 The provided data was audited with a full-cohort dry run. Actual model inference
 and clinical extraction accuracy must be measured in the intended model runtime.

@@ -118,6 +118,8 @@ def load_questions(path=DEFAULT_QUESTIONS):
 
 def normalize_value(field, value):
     """Return (value, status); invalid values never become valid missing answers."""
+    if isinstance(value, str) and value.strip().lower() == "not mentioned":
+        return None, "not_mentioned"
     if is_empty(value):
         return None, "empty"
     if isinstance(value, (list, dict, bool)):

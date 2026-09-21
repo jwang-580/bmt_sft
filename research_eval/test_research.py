@@ -78,6 +78,10 @@ class ResearchTests(unittest.TestCase):
             self.assertNotIn(secret, first)
         toci = extraction.build_prompt(self.encounters[0], ["R11"], self.questions, "baseline")
         self.assertNotIn("FIRST_BASELINE", toci)
+        hypotension = extraction.build_prompt(self.encounters[0], ["R05"], self.questions, "baseline")
+        self.assertNotIn("FIRST_BASELINE", hypotension)
+        self.assertIn("FIRST_DISCHARGE", hypotension)
+        self.assertIn("FIRST_ADMISSION_PROGRESS", hypotension)
         second = extraction.build_prompt(self.encounters[1], ["R10"], self.questions, "baseline")
         self.assertIn("SECOND_DISCHARGE", second)
         self.assertNotIn("FIRST_BASELINE", second)
@@ -136,7 +140,11 @@ class ResearchTests(unittest.TestCase):
                                  date=self.encounters[0]["date"], note=extraction.clinical_note_text(self.encounters[0],
                                  "\n\n".join(extraction.render_note(n) for n in extraction.select_notes(
                                      self.encounters[0], ["R11"], self.questions))))
-            self.assertEqual(prompt, build_user_prompt(expected_note, ["R11"], self.questions, mode))
+            shared = build_user_prompt(expected_note, ["R11"], self.questions, mode)
+            boundary = "Rules:" if mode != "non_json" else "Return plain text only."
+            self.assertEqual(prompt.split(boundary)[0], shared.split(boundary)[0])
+            self.assertNotIn('Use "N/A" if the answer is not found.', prompt)
+            self.assertNotIn('Use "N/A" when the answer is not found.', prompt)
         parsed = extraction.parse_response("Field R11: Y\nField R14: 2", ["R11", "R14"], self.questions, "non_json")
         self.assertEqual(parsed[1]["answers"], "2")
 
@@ -221,7 +229,8 @@ class ResearchTests(unittest.TestCase):
         def fake(messages, mode):
             fields = re.findall(r"^Field (R\d+)$", messages[-1]["content"], flags=re.M)
             calls.append(fields)
-            return json.dumps([dict(field_id=f, answers=self.gold[0][self.questions[f]["target_column"]] or "N/A") for f in fields])
+            return json.dumps([dict(field_id=f, answers=self.gold[0][self.questions[f]["target_column"]] or "N/A",
+                                    evidence_from_text="FIRST_DISCHARGE") for f in fields])
         argv = ["research_extract.py", "--data_dir", str(self.path), "--output_dir", str(output), "--limit", "1",
                 "--note_strategy", "full"]
         with patch("sys.argv", argv), patch.object(extraction, "make_infer", return_value=(fake, lambda: None)), contextlib.redirect_stdout(io.StringIO()):
@@ -250,17 +259,17 @@ class ResearchTests(unittest.TestCase):
         rows, log = extraction.extract_bundle(fake, self.encounters[0], fields, self.questions,
             "baseline", "per_note", evidence_cache=cache, cache_scope="model-a")
         self.assertTrue(all(r["extraction_success"] for r in rows))
-        self.assertEqual(len(prompts), 4)
-        hp_prompt = next(p for p in prompts if "FIRST_BASELINE" in p)
-        self.assertEqual(re.findall(r"^Field (R\d+)$", hp_prompt, flags=re.M), ["R05"])
+        self.assertEqual(len(prompts), 3)
+        self.assertTrue(all("FIRST_BASELINE" not in p for p in prompts))
         for p in prompts[:-1]:
             self.assertEqual(sum(marker in p for marker in
                 ["FIRST_BASELINE", "FIRST_DISCHARGE", "FIRST_ADMISSION_PROGRESS"]), 1)
         for note in self.encounters[0]["notes"]:
-            self.assertTrue(any(note["text"] in p for p in prompts[:-1]))
+            if note["source"] != "history":
+                self.assertTrue(any(note["text"] in p for p in prompts[:-1]))
         for marker in ["FIRST_BASELINE", "FIRST_DISCHARGE", "FIRST_ADMISSION_PROGRESS"]:
             self.assertNotIn(marker, prompts[-1])
-        self.assertEqual(len(cache), 3)
+        self.assertEqual(len(cache), 2)
         self.assertTrue(all(c["record_id"] == self.encounters[0]["record_id"] for c in cache.values()))
         prompts.clear()
         extraction.extract_bundle(fake, self.encounters[0], fields, self.questions,
@@ -269,7 +278,7 @@ class ResearchTests(unittest.TestCase):
         prompts.clear()
         extraction.extract_bundle(fake, self.encounters[0], fields, self.questions,
             "baseline", "per_note", evidence_cache=cache, cache_scope="model-b")
-        self.assertEqual(len(prompts), 4)  # Never reuse another model's evidence.
+        self.assertEqual(len(prompts), 3)  # Never reuse another model's evidence.
 
     def test_unsupported_quotes_fail_validation(self):
         raw = json.dumps([dict(field_id="R14", answers=1, evidence_from_text="invented quote")])
@@ -361,18 +370,18 @@ class ResearchTests(unittest.TestCase):
         argv = ["research_extract.py", "--data_dir", str(self.path), "--output_dir", str(output), "--limit", "1"]
         with patch("sys.argv", argv), patch.object(extraction, "make_infer", return_value=(fake, lambda: None)), contextlib.redirect_stdout(io.StringIO()):
             extraction.main()
-        self.assertEqual([len(c) for c in calls], [1, 5, 5, 5, 5, 5, 5, 5, 4, 4, 4])
+        self.assertEqual([len(c) for c in calls], [5, 5, 5, 5, 5, 5, 5, 4, 4, 4])
         saved = json.loads((output / "note_evidence.json").read_text())
-        self.assertEqual(len(saved), 8)
+        self.assertEqual(len(saved), 7)
         manifest = json.loads((output / "run_manifest.json").read_text())
         self.assertEqual(manifest["variants"][0]["note_strategy"], "per_note")
-        self.assertEqual(manifest["prompt_contract"], "shared_sft_baseline")
+        self.assertEqual(manifest["prompt_contract"], "research_question_instructions_v2")
         self.assertTrue(all("events" not in field for v in saved.values() for field in v["fields"]))
         with patch("sys.argv", argv+["--resume"]), patch.object(extraction, "make_infer") as loader, contextlib.redirect_stdout(io.StringIO()):
             extraction.main()
             loader.assert_not_called()
 
-    def test_baseline_note_and_final_prompts_equal_sft_template_exactly(self):
+    def test_baseline_keeps_sft_layout_with_research_missing_answer_rule(self):
         fields = ["R11", "R12", "R13", "R14"]
         encounter = self.encounters[0]
         texts_and_dates = [("ONE COMPLETE ORIGINAL NOTE", "2020-01-09"),
@@ -383,6 +392,8 @@ class ResearchTests(unittest.TestCase):
             expected = build_sft_user_prompt(record_id=encounter["record_id"], record_id_type=encounter["record_id_type"],
                 date=note_date, note_text=extraction.clinical_note_text(encounter, text),
                 fields_block=build_questions_block(fields, self.questions))
+            expected = expected.replace('Use "N/A" when the answer is not found.',
+                                        'Use "not mentioned" when the requested fact is not documented; use "N/A" only as allowed by the field instructions.')
             self.assertEqual(prompt, expected)
             for obsolete in ("events array", "Synthesize final answers", "Available note counts", "4000 JSON characters"):
                 self.assertNotIn(obsolete, prompt)
@@ -403,6 +414,7 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(extraction.collect_excerpts(note, rows),
                          ["On 1/2 there was no hypoxia and no hypotension."])
         self.assertEqual(extraction.collect_excerpts(note, [dict(evidence_from_text="")]), [])
+        self.assertEqual(extraction.collect_excerpts(note, [dict(answers="not mentioned", evidence_from_text="hypoxia")]), [])
         self.assertEqual(extraction.quote_spans("No\n hypoxia", "No hypoxia"), [(0, 11)])
 
     def test_standard_response_needs_no_events_or_custom_fields(self):
@@ -418,8 +430,9 @@ class ResearchTests(unittest.TestCase):
 
     def test_modes_without_quotes_are_rejected_for_per_note(self):
         for mode in ("non_json", "no_evidence_field"):
-            with self.assertRaisesRegex(ValueError, "evidence_from_text"):
-                extraction.extract_bundle(lambda *_: "", self.encounters[0], ["R01"], self.questions, mode, "per_note")
+            for strategy in ("per_note", "full"):
+                with self.assertRaisesRegex(ValueError, "evidence_from_text"):
+                    extraction.extract_bundle(lambda *_: "", self.encounters[0], ["R01"], self.questions, mode, strategy)
 
     def test_json_wrappers_and_thoughts_preserve_strict_field_validation(self):
         rows = [dict(field_id="R01", answers="N", evidence_from_text="No CRS")]
@@ -507,7 +520,7 @@ class ResearchTests(unittest.TestCase):
         def good(messages, mode):
             fields = re.findall(r"^Field (R\d+)$", messages[-1]["content"], flags=re.M)
             calls.append(fields)
-            return json.dumps([dict(field_id=f, answers="N/A") for f in fields])
+            return json.dumps([dict(field_id=f, answers="N/A", evidence_from_text="") for f in fields])
         def fail_second(messages, mode):
             if len(calls) == 1:
                 return "Invalid generation"
@@ -554,6 +567,61 @@ class ResearchTests(unittest.TestCase):
              contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             extraction.main()
         loader.assert_not_called()
+
+
+    def test_not_mentioned_is_an_abstention_not_a_negative_or_not_applicable_match(self):
+        self.assertEqual(normalize_value("crs_y_n", "not mentioned"), (None, "not_mentioned"))
+        gt = dict(self.gold[0])
+        key = ("001", "2020-01-10")
+        preds = [dict(record_id=record_id(key), field_id=fid, answers="not mentioned",
+                      extraction_success=True) for fid in ("R01", "R02")]
+        summary, metrics, details = score_variant(preds, {key: gt}, {key: gt}, self.questions)
+        self.assertEqual(summary["not_mentioned_predictions"], 2)
+        self.assertEqual(summary["exact_accuracy"], 0)
+        selected = [d for d in details if d["field_id"] in {"R01", "R02"}]
+        self.assertTrue(all(d["prediction_status"] == "not_mentioned" and not d["exact"] for d in selected))
+
+    def test_question_instructions_specify_support_and_missing_information(self):
+        for fid, q in self.questions.items():
+            with self.subTest(fid=fid):
+                instructions = q["field_instructions"].lower()
+                self.assertIn("not mentioned", instructions)
+                self.assertIn("empty evidence_from_text", instructions)
+                self.assertIn("quote", instructions)
+        self.assertIn("'No fevers'", self.questions["R05"]["field_instructions"])
+        self.assertIn("'no transplant reactions'", self.questions["R05"]["field_instructions"])
+        self.assertIn("simultaneously", self.questions["R06"]["field_instructions"])
+        self.assertIn("Deduplicate", self.questions["R14"]["field_instructions"])
+
+    def test_single_extraction_call_no_judge_for_answer_or_not_mentioned(self):
+        cases = [("R05", "N", "No CRS-associated hypotension occurred.", "N"),
+                 ("R05", "not mentioned", "", "not mentioned"),
+                 ("R05", "N/A", "", "not mentioned"),
+                 ("R02", "N/A", "No fever occurred.", "N/A")]
+        for fid, answer, quote, expected in cases:
+            with self.subTest(fid=fid, answer=answer):
+                infer = Mock(return_value=json.dumps([dict(field_id=fid, answers=answer, evidence_from_text=quote)]))
+                infer.last_diagnostics = {}
+                rows, error, attempts = extraction.request_bundle(infer, "Question-specific prompt", [fid], self.questions,
+                    "baseline", retries=0, require_evidence=True, source_text=quote or "Unrelated clinical text.")
+                self.assertFalse(error)
+                self.assertEqual(infer.call_count, 1)
+                self.assertEqual(infer.call_args.args[0][0]["content"], EXTRACTION_SYSTEM_PROMPT)
+                self.assertEqual(rows[0]["answers"], expected)
+                self.assertEqual(rows[0]["evidence_from_text"], quote)
+                self.assertNotIn("evidence_status", rows[0])
+                self.assertNotIn("evidence_review", attempts[0])
+
+    def test_simple_quote_checks_reject_missing_or_inconsistent_evidence(self):
+        for answer, quote in [("Y", ""), ("not mentioned", "No hypotension."),
+                              ("N/A", "Patient is day -6."), ("N", "Invented quote")]:
+            infer = Mock(return_value=json.dumps([dict(field_id="R05", answers=answer, evidence_from_text=quote)]))
+            infer.last_diagnostics = {}
+            rows, error, _ = extraction.request_bundle(infer, "Prompt", ["R05"], self.questions, "baseline", retries=0,
+                require_evidence=True, source_text="No hypotension. Patient is day -6.")
+            self.assertEqual(rows, [])
+            self.assertTrue(error)
+            self.assertEqual(infer.call_count, 1)
 
 
 if __name__ == "__main__":

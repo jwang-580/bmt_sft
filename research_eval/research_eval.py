@@ -107,6 +107,7 @@ def score_variant(predictions, gold, cohort, questions, *, date_tolerance=1, tem
                    missing_predictions=sum(d["prediction_status"] == "missing_prediction" for d in rows),
                    failed_predictions=sum(d["prediction_status"] == "failed" for d in rows),
                    invalid_predictions=sum(d["prediction_status"] == "invalid" for d in rows),
+                   not_mentioned_predictions=sum(d["prediction_status"] == "not_mentioned" for d in rows),
                    correct=sum(d["exact"] for d in scored),
                    exact_accuracy=sum(d["exact"] for d in scored)/n if n else None,
                    tolerance_accuracy=sum(d["tolerance_match"] for d in scored)/n if n else None,
@@ -131,6 +132,7 @@ def score_variant(predictions, gold, cohort, questions, *, date_tolerance=1, tem
                    prediction_coverage=sum(m["predictions_present"] for m in metrics)/len(details) if details else 0,
                    valid_prediction_coverage=sum(d["prediction_status"] in {"valid", "empty"} for d in details)/len(details) if details else 0,
                    unexpected_predictions=unexpected,
+                   not_mentioned_predictions=sum(m["not_mentioned_predictions"] for m in metrics),
                    exact_accuracy=sum(m["correct"] for m in metrics)/n if n else None,
                    macro_exact_accuracy=sum(nonempty)/len(nonempty) if nonempty else None,
                    date_tolerance_days=date_tolerance, temperature_tolerance_f=temp_tolerance)
