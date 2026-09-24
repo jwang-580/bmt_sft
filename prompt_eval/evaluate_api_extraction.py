@@ -5,6 +5,8 @@ Uses the same prompts, parsing, score calculation, and prediction format as
 evaluate_gemma4_extraction.py. API keys are loaded from .env or the environment.
 The default evaluation runs baseline on all notes and all form fields, using
 full notes and five fields per API call.
+Gemini uses its model output limit by default because its token cap includes
+thinking tokens; --gemini_max_output_tokens can set an explicit cap.
 
 Examples:
     python prompt_eval/evaluate_api_extraction.py --dataset mimic --limit 5
@@ -91,18 +93,27 @@ def generate(client, model, system_prompt, user_prompt, mode, max_output_tokens)
     if provider == "google":
         # Gemini 3.8 Flash supports low/medium/high thinking; low is the
         # closest available setting for the existing no_reasoning variant.
+        generation_config = {"thinking_level": "low" if mode == "no_reasoning" else "medium"}
+        if max_output_tokens is not None:
+            generation_config["max_output_tokens"] = max_output_tokens
         interaction = client.interactions.create(
             model=model,
             system_instruction=system_prompt,
             input=user_prompt,
-            generation_config={
-                "thinking_level": "low" if mode == "no_reasoning" else "medium",
-                "max_output_tokens": max_output_tokens,
-            },
+            generation_config=generation_config,
             store=False,
         )
         if interaction.status != "completed":
-            raise RuntimeError(f"Gemini interaction status: {interaction.status}")
+            usage = getattr(interaction, "usage", None)
+            token_info = (
+                f"; output tokens: {getattr(usage, 'total_output_tokens', 'unknown')}"
+                f"; thought tokens: {getattr(usage, 'total_thought_tokens', 'unknown')}"
+            ) if usage is not None else ""
+            raise RuntimeError(
+                f"Gemini interaction status: {interaction.status}{token_info}. "
+                "No answer was saved for this batch. If incomplete, remove/increase "
+                "--gemini_max_output_tokens or try --note_strategy chunked."
+            )
         return interaction.output_text or ""
 
     # Opus 5.5 always uses adaptive thinking. Low effort is the closest
@@ -119,13 +130,23 @@ def generate(client, model, system_prompt, user_prompt, mode, max_output_tokens)
     return "\n".join(block.text for block in message.content if block.type == "text")
 
 
-def generate_predictions(client, model, note, field_batch, metadata, mode, prompt, max_output_tokens, parse_retries):
+def generate_predictions(
+    client, model, note, field_batch, metadata, mode, prompt,
+    max_output_tokens, parse_retries, gemini_max_output_tokens=None,
+):
     settings = mode_settings(mode)
     attempts = []
     parse_error = ""
     generated = ""
     for attempt in range(1, parse_retries + 2):
-        generated = generate(client, model, build_system_prompt(), prompt, mode, max_output_tokens)
+        request_limit = gemini_max_output_tokens if MODELS[model] == "google" else max_output_tokens
+        try:
+            generated = generate(client, model, build_system_prompt(), prompt, mode, request_limit)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{model} failed for record {note['record_id']}, "
+                f"fields {field_batch}, mode {mode}: {exc}"
+            ) from exc
         try:
             records = (
                 common.parse_json_generation(generated)
@@ -161,7 +182,14 @@ def parse_args(argv=None):
     parser.add_argument("--skip_runs", default="")
     parser.add_argument("--limit", type=int, default=0, help="Maximum notes; 0 (default) means all notes.")
     parser.add_argument("--field_limit", type=int, default=None, help="Maximum form fields; default is all fields.")
-    parser.add_argument("--max_output_tokens", type=int, default=8192)
+    parser.add_argument(
+        "--max_output_tokens", type=int, default=8192,
+        help="Output token cap for OpenAI and Anthropic (default: 8192).",
+    )
+    parser.add_argument(
+        "--gemini_max_output_tokens", type=int, default=None,
+        help="Optional Gemini output cap; default leaves it unset to allow thinking tokens.",
+    )
     parser.add_argument("--parse_retries", type=int, default=1)
     parser.add_argument("--note_strategy", choices=["auto", "full", "chunked"], default="full")
     parser.add_argument("--chunk_chars", type=int, default=12000)
@@ -175,6 +203,8 @@ def parse_args(argv=None):
         parser.error("--limit, --parse_retries, and --sleep must be non-negative")
     if args.max_output_tokens <= 0:
         parser.error("--max_output_tokens must be positive")
+    if args.gemini_max_output_tokens is not None and args.gemini_max_output_tokens <= 0:
+        parser.error("--gemini_max_output_tokens must be positive")
     return args
 
 
@@ -273,6 +303,7 @@ def main(argv=None):
                                             client, model, chunk_note, batch, metadata, mode,
                                             build_user_prompt(chunk_note, batch, metadata, mode),
                                             args.max_output_tokens, args.parse_retries,
+                                            args.gemini_max_output_tokens,
                                         )
                                         calls += len(attempts)
                                         parse_errors += bool(error)
@@ -286,6 +317,7 @@ def main(argv=None):
                                 text, preds, error, attempts = generate_predictions(
                                     client, model, note, batch, metadata, mode, prompt,
                                     args.max_output_tokens, args.parse_retries,
+                                    args.gemini_max_output_tokens,
                                 )
                                 calls += len(attempts)
                                 parse_errors += bool(error)
