@@ -1,0 +1,11 @@
+# Separate environment: the original SFT run pins TRL 0.24.0.
+unsloth
+datasets==4.3.0
+transformers>=5.5.0,<6
+tokenizers>=0.22.0,<=0.23.0
+trl>=0.28.0,<1
+peft
+accelerate
+bitsandbytes
+wandb
+python-dotenv>=1.0.0
