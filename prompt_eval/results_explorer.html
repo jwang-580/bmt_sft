@@ -135,7 +135,7 @@
     <header>
       <div>
         <h1>BMT evaluation explorer</h1>
-        <p class="muted">Compare runs, inspect extracted answers, and recompute accuracy locally.</p>
+        <p class="muted">Inspect local results. Browser scores are previews; use score_predictions.py with an explicit cohort and scoring policy for publication.</p>
       </div>
       <button id="clearButton" class="button" type="button">Clear data</button>
     </header>
@@ -209,10 +209,8 @@
   <script>
     (() => {
       "use strict";
-      const defaultMimicCohort = [
-        "20056386", "21334581", "21709148", "21951412", "23243823", "24341563", "24543622", "24801854", "24829092", "24914573",
-        "25009858", "25904914", "25926571", "26181264", "26419924", "26612662", "26612663", "26612664", "27683739", "29595871"
-      ];
+      // Import a cohort file locally; no patient identifiers are bundled here.
+      const defaultMimicCohort = [];
       const state = {
         files: new Set(), predictions: [], importedMetrics: [], gold: { mimic: new Map(), osu: new Map() },
         cohort: { mimic: new Set(defaultMimicCohort), osu: new Set() }, sort: { key: "exact_accuracy", dir: -1 }
@@ -398,9 +396,12 @@
             const key = `${row.record_id}|${row.field_id}`;
             if (!gold.has(key)) continue;
             covered++; const goldAnswer = gold.get(key);
-            const exact = answersMatch(row.field_id, row.answers, goldAnswer);
+            const usable = !row.parse_error && row.extraction_success !== false &&
+              !["failed", "invalid", "missing"].includes(row.extraction_status) &&
+              row.answers != null && (typeof row.answers !== "string" || row.answers.trim() !== "");
+            const exact = usable && answersMatch(row.field_id, row.answers, goldAnswer);
             if (exact) correct++;
-            if (exact || isEmpty(row.answers) === isEmpty(goldAnswer)) emptyCorrect++;
+            if (usable && (exact || isEmpty(row.answers) === isEmpty(goldAnswer))) emptyCorrect++;
           }
           let expected = 0;
           const cohort = state.cohort[first.dataset];

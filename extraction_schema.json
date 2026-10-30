@@ -1,11 +1,85 @@
 {
-    "hadm_id": 00000000,
-    "field_id": "1",
-    "field_category": ,
-    "field_name": ,
-    "field_instructions": ,
-    "answers": ,
-    "evidence_from_text": ,
-    "reasoning_trace": ,
-}
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Canonical registry extraction response",
+  "description": "Successful baseline output. Evidence and rationales must be removed from public exports.",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "required": [
+      "record_id",
+      "record_id_type",
+      "date",
+      "field_id",
+      "field_category",
+      "field_name",
+      "field_instructions",
+      "answers",
+      "evidence_from_text",
+      "reasoning_trace"
+    ],
+    "properties": {
+      "record_id": {
+        "type": "string"
+      },
+      "record_id_type": {
+        "type": "string"
+      },
+      "date": {
+        "type": "string"
+      },
+      "field_id": {
+        "type": "string"
+      },
+      "field_category": {
+        "type": "string"
+      },
+      "field_name": {
+        "type": "string"
+      },
+      "field_instructions": {
+        "type": "string"
+      },
+      "evidence_from_text": {
+        "type": "string"
+      },
+      "reasoning_trace": {
+        "type": "string"
+      },
+      "answers": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          }
+        ]
+      },
+      "extraction_success": {
+        "const": true
+      },
+      "extraction_status": {
+        "const": "extracted"
+      },
+      "response_contract": {
+        "const": "registry_response_v2"
+      },
+      "parse_error": {
+        "const": ""
+      }
+    },
+    "additionalProperties": false
+  }
 }
