@@ -178,9 +178,12 @@ def gold_label(field, row):
     value, status = normalize_value(field, row.get(field))
     if status != "empty":
         return value, status
-    # A blank is scorable as N/A only for an explicitly negative parent.
-    parent = "toci_y_n" if field in {"toci_start_date", "toci_stop_date"} else "crs_y_n"
-    if field in DATE_FIELDS | {"max_temp"} and normalize_value(parent, row.get(parent))[0] == "N":
+    # An explicit N/A label is different from an unannotated blank. CRS absence
+    # does not establish absence of infectious/other fever during admission.
+    if field in DATE_FIELDS | {"max_temp"} and str(row.get(field, "")).strip().lower() in {"na", "n/a"}:
+        return None, "not_applicable"
+    # Tocilizumab dates alone have a directly applicable negative parent.
+    if field in {"toci_start_date", "toci_stop_date"} and normalize_value("toci_y_n", row.get("toci_y_n"))[0] == "N":
         return None, "not_applicable"
     return None, "unlabeled"
 

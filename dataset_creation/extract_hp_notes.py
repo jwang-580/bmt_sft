@@ -272,7 +272,7 @@ def main():
     parser.add_argument("--notes", default="data/h_p_notes.csv", help="Input H&P notes CSV")
     parser.add_argument(
         "--questions",
-        default="data/CIBMTR_Form_2400_R11_Items_simplified.csv",
+        default="resources/CIBMTR_Form_2400_R11_Items_simplified.csv",
         help="CIBMTR question metadata CSV",
     )
     parser.add_argument("--reference", default="data/final_merged.csv", help="Reference CSV keyed by MRN")

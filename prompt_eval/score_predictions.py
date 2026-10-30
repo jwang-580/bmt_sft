@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -19,6 +20,11 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    from .registry_contract import prediction_is_usable
+except ImportError:
+    from registry_contract import prediction_is_usable
 
 try:
     from .evaluate_gemma4_extraction import (
@@ -47,7 +53,7 @@ DEFAULT_GOLD_BY_DATASET = {
     "osu": REPO_ROOT / "data" / "osu_form_2400_all_extractions.json",
 }
 DEFAULT_MIMIC_RECORD_IDS = REPO_ROOT / "fine_tuning" / "mimic_eval_record_ids.json"
-DEFAULT_QUESTIONS = REPO_ROOT / "data" / "CIBMTR_Form_2400_R11_Items_simplified.csv"
+DEFAULT_QUESTIONS = REPO_ROOT / "resources" / "CIBMTR_Form_2400_R11_Items_simplified.csv"
 GROUP_FIELDS = ("dataset", "model", "mode", "fields_per_call", "note_strategy")
 
 
@@ -82,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         help="Score record IDs found in each file instead of applying a cohort list.",
     )
     parser.add_argument("--questions", type=Path, default=DEFAULT_QUESTIONS)
+    parser.add_argument(
+        "--scoring_policy", choices=("valid-response-v2", "legacy-answer-only"),
+        default="valid-response-v2",
+        help="Default counts failed or missing answers as incorrect. Legacy policy is for historical comparisons only.",
+    )
     parser.add_argument(
         "--scope",
         choices=("all-gold-fields", "predicted-fields"),
@@ -147,7 +158,6 @@ def flatten_predictions(value: Any, inherited: dict[str, Any] | None = None) -> 
         prediction.setdefault(name, metadata_value)
     prediction["record_id"] = str(record_id).strip()
     prediction["field_id"] = normalize_question_number(prediction["field_id"])
-    prediction.setdefault("answers", "N/A")
     return [prediction]
 
 
@@ -488,7 +498,10 @@ def score_group(
     cohort_ids: set[str] | None,
     scope: str,
     question_metadata: dict[str, dict[str, Any]],
+    scoring_policy: str = "valid-response-v2",
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    if scoring_policy not in {"valid-response-v2", "legacy-answer-only"}:
+        raise ValueError("Unknown registry scoring policy")
     prediction_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     duplicate_count = 0
     for row in rows:
@@ -497,6 +510,8 @@ def score_group(
             continue
         if key in prediction_by_key:
             duplicate_count += 1
+            if scoring_policy == "valid-response-v2":
+                raise ValueError("Duplicate record/field predictions within a registry variant")
         prediction_by_key[key] = row
 
     predicted_record_ids = {record_id for record_id, _ in prediction_by_key}
@@ -535,15 +550,19 @@ def score_group(
             )
             continue
 
-        predicted_answer = prediction.get("answers", "N/A")
+        usable = prediction_is_usable(prediction)
+        predicted_answer = prediction.get("answers", "N/A" if scoring_policy == "legacy-answer-only" else None)
         match_type = classify_answer_match(
             key[1],
             predicted_answer,
             gold_answer,
             question_metadata.get(key[1]),
         )
-        exact_match = match_type != "no_match"
-        empty_match = exact_match or is_empty_answer(predicted_answer) == is_empty_answer(gold_answer)
+        credit_allowed = usable or scoring_policy == "legacy-answer-only"
+        exact_match = credit_allowed and match_type != "no_match"
+        if not credit_allowed:
+            match_type = "failed_response"
+        empty_match = credit_allowed and (exact_match or is_empty_answer(predicted_answer) == is_empty_answer(gold_answer))
         exact += int(exact_match)
         empty_nonempty += int(empty_match)
         parse_error = str(prediction.get("parse_error", "") or "")
@@ -553,7 +572,7 @@ def score_group(
                 "record_id": key[0],
                 "field_id": key[1],
                 "field_name": question_metadata.get(key[1], {}).get("field_name", ""),
-                "status": "correct" if exact_match else "incorrect",
+                "status": "correct" if exact_match else ("incorrect" if usable else "failed_response"),
                 "exact_match": exact_match,
                 "match_type": match_type,
                 "empty_nonempty_match": empty_match,
@@ -571,8 +590,11 @@ def score_group(
         "gold_covered": len(covered_keys),
         "coverage": ratio(len(covered_keys), len(expected_keys)),
         "correct": exact,
+        "valid_answer_accuracy": ratio(exact, len(expected_keys)),
+        "failed_responses": sum(row["status"] == "failed_response" for row in details),
+        "scoring_policy": scoring_policy,
         "equivalent_matches": sum(
-            row.get("match_type", "") not in {"", "exact", "no_match"} for row in details
+            row.get("exact_match", False) and row.get("match_type", "") not in {"", "exact", "no_match"} for row in details
         ),
         "exact_accuracy": ratio(exact, len(covered_keys)),
         "strict_exact_accuracy": ratio(exact, len(expected_keys)),
@@ -674,13 +696,14 @@ def score_file(
             cohort_ids=cohort_ids,
             scope=args.scope,
             question_metadata=question_metadata,
+            scoring_policy=getattr(args, "scoring_policy", "valid-response-v2"),
         )
         summaries.append({**metadata, **metrics})
         error_rows.extend({**metadata, **row} for row in errors)
         equivalence_rows.extend(
             {**metadata, **row}
             for row in details
-            if row.get("match_type", "") not in {"", "exact", "no_match"}
+            if row.get("exact_match", False) and row.get("match_type", "") not in {"", "exact", "no_match"}
         )
         per_field_rows.extend(aggregate_details(details, metadata, "field_id"))
         per_record_rows.extend(aggregate_details(details, metadata, "record_id"))
@@ -693,6 +716,14 @@ def score_file(
     per_record_path = output_dir / f"{prefix}_per_record.csv"
 
     summary_payload = {
+        "scoring_policy": getattr(args, "scoring_policy", "valid-response-v2"),
+        "input_sha256": hashlib.sha256(predictions_path.read_bytes()).hexdigest(),
+        "reference_sha256": hashlib.sha256(gold_path.read_bytes()).hexdigest(),
+        "scorer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "question_catalog_sha256": hashlib.sha256(args.questions.resolve().read_bytes()).hexdigest(),
+        "response_contract_sha256": hashlib.sha256(Path(__file__).with_name("registry_contract.py").read_bytes()).hexdigest(),
+        "answer_normalizer_sha256": hashlib.sha256(Path(__file__).with_name("evaluate_gemma4_extraction.py").read_bytes()).hexdigest(),
+        "cohort_sha256": hashlib.sha256(record_ids_path.read_bytes()).hexdigest() if record_ids_path else None,
         "predictions_file": str(predictions_path),
         "dataset": dataset,
         "ground_truth_file": str(gold_path),

@@ -284,7 +284,7 @@ def main():
     print("Loading data...")
     try:
         notes = read_csv_records("data/bmt_initial_progression_notes_all.csv")
-        questions = read_csv_records("data/CIBMTR_Form_2400_R11_Items_simplified.csv")
+        questions = read_csv_records("resources/CIBMTR_Form_2400_R11_Items_simplified.csv")
     except Exception as e:
         print(f"Error loading files: {e}")
         return

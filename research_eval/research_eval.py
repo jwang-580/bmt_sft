@@ -9,15 +9,42 @@ from datetime import date
 from pathlib import Path
 
 try:
-    from .research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, YN_FIELDS, DATE_FIELDS,
+    from .research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, YN_FIELDS, DATE_FIELDS, COUNT_FIELDS,
         encounter_key, gold_label, load_ground_truth, load_questions, normalize_value,
-        read_csv, record_id, unique_encounters, write_csv, write_json)
+        read_csv, record_id, unique_encounters, write_csv, write_json, file_hash)
 except ImportError:
-    from research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, YN_FIELDS, DATE_FIELDS,
+    from research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, YN_FIELDS, DATE_FIELDS, COUNT_FIELDS,
         encounter_key, gold_label, load_ground_truth, load_questions, normalize_value,
-        read_csv, record_id, unique_encounters, write_csv, write_json)
+        read_csv, record_id, unique_encounters, write_csv, write_json, file_hash)
 
 VARIANT_FIELDS = ("model", "mode", "note_strategy", "fields_per_call")
+SCORING_POLICY = "fever_blank_unlabeled_not_mentioned_as_no_v1"
+
+
+def resolve_evaluation_ground_truth(predictions_path, ground_truth_path=None, manifest_path=None):
+    """An explicit label file wins; otherwise honor this run's saved label revision."""
+    if ground_truth_path is not None:
+        return Path(ground_truth_path)
+    manifest_path = Path(manifest_path) if manifest_path else Path(predictions_path).parent / "run_manifest.json"
+    if manifest_path.is_file():
+        configured = json.loads(manifest_path.read_text(encoding="utf-8")).get("evaluation_ground_truth")
+        if configured:
+            path = Path(configured)
+            return path if path.is_absolute() else Path(__file__).resolve().parents[1] / path
+    return DEFAULT_DATA / "toci_ptcy_crs.csv"
+
+
+def scoring_value(field, value, status):
+    """Apply the evaluation policy without rewriting extraction answers/statuses."""
+    if status != "not_mentioned":
+        return value, status
+    if field in YN_FIELDS:
+        return "N", "valid"
+    if field in COUNT_FIELDS:
+        return 0, "valid"
+    if field in DATE_FIELDS | {"max_temp"}:
+        return None, "empty"
+    raise ValueError(f"No negative scoring value defined for {field}")
 
 
 def load_predictions(path, questions):
@@ -78,11 +105,13 @@ def score_variant(predictions, gold, cohort, questions, *, date_tolerance=1, tem
             prediction, pred_status = normalize_value(field, p.get("answers")) if p else (None, "missing_prediction")
             if p is not None and prediction_failed(p):
                 pred_status = "failed"
+            extracted_prediction = prediction
+            prediction, scoring_status = scoring_value(field, prediction, pred_status)
             scorable = gt_status in {"valid", "not_applicable"}
-            usable = pred_status in {"valid", "empty"}
+            usable = scoring_status in {"valid", "empty"}
             exact = bool(scorable and usable and target == prediction)
             error = None
-            if scorable and pred_status == "valid" and gt_status == "valid":
+            if scorable and scoring_status == "valid" and gt_status == "valid":
                 if field in DATE_FIELDS:
                     error = abs((date.fromisoformat(prediction) - date.fromisoformat(target)).days)
                 elif field not in YN_FIELDS:
@@ -92,9 +121,12 @@ def score_variant(predictions, gold, cohort, questions, *, date_tolerance=1, tem
             details.append(dict(record_id=rid, MRN=key[0], bmt_date=key[1], field_id=fid,
                                 target_column=field, gold_answer=gt.get(field) if gt else None,
                                 gold_status=gt_status, predicted_answer=p.get("answers") if p else None,
-                                prediction_status=pred_status, scorable=scorable, exact=exact,
+                                prediction_status=pred_status, scoring_status=scoring_status,
+                                not_mentioned_as_no=pred_status == "not_mentioned",
+                                scorable=scorable, exact=exact,
                                 tolerance_match=bool(scorable and tolerant), absolute_error=error,
-                                normalized_gold=target, normalized_prediction=prediction))
+                                normalized_gold=target, normalized_prediction=prediction,
+                                extracted_normalized_prediction=extracted_prediction))
     metrics = []
     for fid, q in questions.items():
         rows = [d for d in details if d["field_id"] == fid]
@@ -108,6 +140,7 @@ def score_variant(predictions, gold, cohort, questions, *, date_tolerance=1, tem
                    failed_predictions=sum(d["prediction_status"] == "failed" for d in rows),
                    invalid_predictions=sum(d["prediction_status"] == "invalid" for d in rows),
                    not_mentioned_predictions=sum(d["prediction_status"] == "not_mentioned" for d in rows),
+                   not_mentioned_as_no_correct=sum(d["not_mentioned_as_no"] and d["exact"] for d in scored),
                    correct=sum(d["exact"] for d in scored),
                    exact_accuracy=sum(d["exact"] for d in scored)/n if n else None,
                    tolerance_accuracy=sum(d["tolerance_match"] for d in scored)/n if n else None,
@@ -116,7 +149,7 @@ def score_variant(predictions, gold, cohort, questions, *, date_tolerance=1, tem
             positive = [d for d in scored if d["normalized_gold"] == "Y"]
             negative = [d for d in scored if d["normalized_gold"] == "N"]
             tp = sum(d["exact"] for d in positive)
-            fp = sum(d["prediction_status"] == "valid" and d["normalized_prediction"] == "Y" for d in negative)
+            fp = sum(d["scoring_status"] == "valid" and d["normalized_prediction"] == "Y" for d in negative)
             fn = len(positive)-tp
             tn = sum(d["exact"] for d in negative)
             row.update(tp=tp, fp=fp, fn=fn, tn=tn,
@@ -128,12 +161,15 @@ def score_variant(predictions, gold, cohort, questions, *, date_tolerance=1, tem
     n = sum(m["scorable"] for m in metrics)
     nonempty = [m["exact_accuracy"] for m in metrics if m["exact_accuracy"] is not None]
     summary = dict(expected_encounters=len(cohort), expected_answers=len(details), scorable_answers=n,
+                   scoring_policy=SCORING_POLICY,
                    excluded_gt_answers=len(details)-n,
                    prediction_coverage=sum(m["predictions_present"] for m in metrics)/len(details) if details else 0,
                    valid_prediction_coverage=sum(d["prediction_status"] in {"valid", "empty"} for d in details)/len(details) if details else 0,
+                   scoring_prediction_coverage=sum(d["scoring_status"] in {"valid", "empty"} for d in details)/len(details) if details else 0,
                    unexpected_predictions=unexpected,
                    failed_predictions=sum(m["failed_predictions"] for m in metrics),
                    not_mentioned_predictions=sum(m["not_mentioned_predictions"] for m in metrics),
+                   not_mentioned_as_no_correct=sum(m["not_mentioned_as_no_correct"] for m in metrics),
                    exact_accuracy=sum(m["correct"] for m in metrics)/n if n else None,
                    macro_exact_accuracy=sum(nonempty)/len(nonempty) if nonempty else None,
                    date_tolerance_days=date_tolerance, temperature_tolerance_f=temp_tolerance)
@@ -150,6 +186,7 @@ def evaluate_file(predictions_path, ground_truth_path, cohort_path, output_dir, 
         raise ValueError("The explicitly supplied run manifest does not exist")
     manifest_path = Path(manifest_path) if manifest_path else Path(predictions_path).parent / "run_manifest.json"
     expected_variants = []
+    manifest = {}
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         ids = set(manifest["record_ids"])
@@ -170,10 +207,26 @@ def evaluate_file(predictions_path, ground_truth_path, cohort_path, output_dir, 
     if not groups:
         groups[("unspecified",)*4] = []
     summaries, field_metrics, details = [], [], []
+    label_metadata = {}
+    label_manifest_path = Path(ground_truth_path).with_suffix(".manifest.json")
+    if label_manifest_path.is_file():
+        label_manifest = json.loads(label_manifest_path.read_text(encoding="utf-8"))
+        if label_manifest.get("revised_sha256") != file_hash(ground_truth_path):
+            raise ValueError("Label CSV does not match its revision manifest")
+        label_metadata = dict(evaluation_type=label_manifest["evaluation_type"],
+                              label_revision=label_manifest["revision"])
     for variant, rows in groups.items():
         summary, metrics, scored = score_variant(rows, gold, cohort, questions,
                                                  date_tolerance=date_tolerance, temp_tolerance=temp_tolerance)
         metadata = dict(zip(VARIANT_FIELDS, variant))
+        if manifest.get("evaluation_type"):
+            configured_labels = resolve_evaluation_ground_truth(predictions_path, manifest_path=manifest_path)
+            if configured_labels.resolve() == Path(ground_truth_path).resolve():
+                metadata["evaluation_type"] = manifest["evaluation_type"]
+                metadata["label_revision"] = manifest.get("evaluation_label_revision")
+            else:
+                metadata["evaluation_type"] = "explicit_alternative_labels"
+        metadata.update(label_metadata)
         summaries.append({**metadata, **summary})
         field_metrics.extend({**metadata, **m} for m in metrics)
         details.extend({**metadata, **d} for d in scored)
@@ -185,13 +238,26 @@ def evaluate_file(predictions_path, ground_truth_path, cohort_path, output_dir, 
                        ("research_evaluation_details.csv", details)):
         fields = list(dict.fromkeys(k for row in rows for k in row))
         write_csv(output_dir / name, rows, fields)
+    # Keep rescoring provenance separate from the original generation manifest.
+    write_json(output_dir / "research_evaluation_manifest.json", dict(
+        scoring_policy=SCORING_POLICY,
+        not_mentioned_as_no={"yes_no": "N", "counts": 0, "dates_and_temperature": "N/A"},
+        blank_fever_gold="unlabeled; never inferred from CRS absence",
+        date_tolerance_days=date_tolerance, temperature_tolerance_f=temp_tolerance,
+        evaluation_type=summaries[0].get("evaluation_type", "original_annotations"),
+        label_revision=summaries[0].get("label_revision"),
+        input_hashes={str(Path(path).resolve()): file_hash(path) for path in
+                      (predictions_path, ground_truth_path, cohort_path, questions_path)},
+        generation_manifest_hash=file_hash(manifest_path) if manifest_path.exists() else None,
+        code_hashes={str(path.resolve()): file_hash(path) for path in
+                     (Path(__file__), Path(__file__).with_name("research_common.py"))}))
     return summaries
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--predictions", required=True, help="Long JSON/CSV or legacy wide CSV")
-    parser.add_argument("--ground-truth", "--ground_truth", default=str(DEFAULT_DATA / "toci_ptcy_crs.csv"))
+    parser.add_argument("--ground-truth", "--ground_truth", help="Label CSV; defaults to this run's configured labels, then the canonical label table")
     parser.add_argument("--cohort", default=str(DEFAULT_DATA / "target_filtered.csv"))
     parser.add_argument("--questions", default=str(DEFAULT_QUESTIONS))
     parser.add_argument("--manifest", help="Subset manifest; auto-detected beside predictions")
@@ -201,7 +267,8 @@ def main():
     args = parser.parse_args()
     if args.date_tolerance < 0 or args.temperature_tolerance < 0:
         parser.error("Tolerances must be nonnegative")
-    summaries = evaluate_file(args.predictions, args.ground_truth, args.cohort,
+    labels = resolve_evaluation_ground_truth(args.predictions, args.ground_truth, args.manifest)
+    summaries = evaluate_file(args.predictions, labels, args.cohort,
                              args.output_dir or Path(args.predictions).parent,
                              args.questions, args.manifest, args.date_tolerance, args.temperature_tolerance)
     print(json.dumps(summaries, indent=2))

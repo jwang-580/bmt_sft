@@ -1,0 +1,5 @@
+# Lightweight analysis and reconstruction dependencies; GPU and API stacks are separate.
+numpy>=2,<3
+pandas>=2.2,<4
+python-dotenv>=1,<2
+tqdm>=4,<5

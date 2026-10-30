@@ -25,13 +25,19 @@ from prompt_eval.evaluate_gemma4_extraction import (generate, load_model, resolv
     format_messages_for_processor, final_answer_text)
 from prompt_eval.extraction_prompts import (DEFAULT_MODES, EXTRACTION_SYSTEM_PROMPT,
     build_user_prompt, mode_settings)
-from research_eval.research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, ROOT, DATE_FIELDS,
+from research_eval.research_common import (DEFAULT_DATA, DEFAULT_QUESTIONS, ROOT, DATE_FIELDS, YN_FIELDS, COUNT_FIELDS,
     candidate_spans, data_audit, file_hash, load_encounters, load_questions, normalize_value,
     render_note, select_notes, write_json)
 from research_eval.research_eval import evaluate_file, prediction_failed
 
 # Imported verbatim from the same module used to construct the training examples.
 SYSTEM_PROMPT = EXTRACTION_SYSTEM_PROMPT
+INTEGRATION_SYSTEM_PROMPT = (
+    "Integrate structured findings already extracted from this patient's notes. "
+    "Your task is chronology, conflict resolution and deduplication, not clinical-note extraction. "
+    "Treat each finding's clinical attribution as already assessed by the first pass. "
+    "Use only the supplied findings; return the requested JSON records.")
+FINAL_PASS_CONTRACT = "structured_findings_integration_v1"
 
 
 class ContextLimitError(ValueError):
@@ -65,7 +71,7 @@ def build_prompt(encounter, fields, questions, mode, *, note_text=None, note_dat
     note = dict(record_id=encounter["record_id"], record_id_type=encounter["record_id_type"],
                 date=note_date or encounter["date"], note=clinical_note_text(encounter, note_text))
     prompt = build_user_prompt(note, fields, questions, mode)
-    # Research now distinguishes absence of documentation from non-applicability.
+    # Distinguish undocumented findings from explicitly non-applicable values.
     # Do not change the shared SFT builder or leave a conflicting generic N/A rule.
     for conjunction in ("when", "if"):
         prompt = prompt.replace(f'Use "N/A" {conjunction} the answer is not found.',
@@ -103,7 +109,7 @@ def quote_spans(source_text, quote):
 
 
 def collect_excerpts(note, rows, targets=()):
-    """Select whole sentences/paragraphs containing source-matched quotes; retain negation/dates.
+    """Legacy excerpt selection, retained to reconstruct historical saved runs.
 
     The model reads the entire original note. This is evidence selection afterward,
     not a text-splitting strategy. If a source has no sentence boundaries, its full
@@ -136,13 +142,85 @@ def collect_excerpts(note, rows, targets=()):
 
 
 def render_evidence_notes(findings):
-    """Final input consists of verbatim source excerpts, never inferred answer values."""
+    """Legacy excerpt renderer, retained for auditing historical saved runs."""
     sections = []
     for finding in findings:
         note = dict(finding["note"], text="\n[...]\n".join(finding["excerpts"]))
         if note["text"]:
             sections.append(render_note(note))
     return "\n\n".join(sections)
+
+
+def integration_finding(note, note_index, rows):
+    """Pass first-pass decisions and chronology, excluding original text and quotes."""
+    return dict(note_id=f"note_{note_index:04d}", source=note["source"], note_date=note["date"],
+                date_conflict=bool(note.get("date_conflict", False)),
+                slot_derived_date=note.get("expected_date"),
+                fields=[dict(field_id=r["field_id"], answers=r["answers"],
+                             extraction_status=r["extraction_status"],
+                             reasoning_trace=r.get("reasoning_trace", "")) for r in rows])
+
+
+def build_integration_prompt(encounter, fields, questions, mode, findings):
+    blocks = []
+    for fid in fields:
+        field = questions[fid]["target_column"]
+        options = ("Y | N | not mentioned" if field in YN_FIELDS else
+                   "nonnegative integer | not mentioned" if field in COUNT_FIELDS else
+                   "YYYY-MM-DD | N/A | not mentioned" if field in DATE_FIELDS else
+                   "number in Fahrenheit | N/A | not mentioned")
+        blocks.append(f"Field {fid}\nField name: {questions[fid]['field_name']}\nAnswer type: {options}")
+    keys = ["field_id", "answers", "supporting_note_ids"]
+    if "reasoning_trace" in mode_settings(mode)["extra_fields"]:
+        keys.append("reasoning_trace")
+    metadata = {k: encounter[k] for k in ("record_id", "bmt_date", "admit_date")}
+    return f"""Integrate daily findings for one admission.
+
+Record metadata:
+{json.dumps(metadata, ensure_ascii=False)}
+
+Fields:
+{chr(10).join(blocks)}
+
+Integration rules:
+- Use the first-pass field answers and their recorded rationales. Do not reassess whether a diagnosis or treatment indication is supported by a clinical quote.
+- Note dates and source identifiers establish chronology. Do not substitute a note date for an extracted event date. Preserve date conflicts.
+- For yes/no events, a documented Y at any eligible time overrides an earlier N. Later recovery, N, or not mentioned does not cancel an event.
+- not mentioned supplies no new observation and must not erase an extracted value. If no usable finding exists for a field, return not mentioned.
+- For fever, integrate the first fever episode. Select the earliest extracted onset, last fever within that episode, and highest extracted temperature within it; a new episode beginning more than three days later is separate. Do not invent missing dates or temperatures.
+- For pressors, take the maximum concurrent count, not a sum across notes.
+- For tocilizumab, preserve the first-pass CRS attribution; take the earliest administration date and latest administration date. Deduplicate repeated mentions of the same dose/day. Distinguish daily counts from cumulative totals using the findings and rationales; never blindly sum repeated counts. Return not mentioned if the total cannot be resolved.
+- Integrate progress, discharge, and history findings using their source/date metadata. History establishes baseline only. Use discharge findings to reconcile the admission course.
+- For each extracted answer, list the contributing note_id values in supporting_note_ids. Only cite notes containing a usable finding for that field. For not mentioned, use an empty list.
+- Return exactly one object per requested field with keys {json.dumps(keys)}. reasoning_trace, when requested, briefly explains integration.
+- Return only a JSON array. Do not generate evidence quotes or new clinical findings.
+
+Daily findings JSON:
+{json.dumps(findings, ensure_ascii=False, indent=2)}"""
+
+
+def integrated_rows(rows, findings, evidence_by_note):
+    """Resolve provenance to quotes already validated in the first pass."""
+    index = {f["note_id"]: {r["field_id"]: r for r in f["fields"]} for f in findings}
+    for row in rows:
+        refs = row.get("supporting_note_ids")
+        if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs) or len(refs) != len(set(refs)):
+            raise ValueError(f"{row['field_id']}: expected unique supporting_note_ids")
+        if str(row["answers"]).strip().lower() == "not mentioned":
+            if refs:
+                raise ValueError(f"{row['field_id']}: not mentioned must have no supporting notes")
+        elif not refs:
+            raise ValueError(f"{row['field_id']}: integrated answer requires contributing notes")
+        quotes = []
+        for ref in refs:
+            finding = index.get(ref, {}).get(row["field_id"])
+            if finding is None or finding["extraction_status"] != "extracted":
+                raise ValueError(f"{row['field_id']}: supporting note has no extracted finding: {ref}")
+            quote = evidence_by_note[ref][row["field_id"]].get("evidence_from_text", "")
+            if quote and quote not in quotes:
+                quotes.append(quote)
+        row["evidence_from_text"] = "\n".join(quotes)
+    return rows
 
 
 def decode_record_payloads(text):
@@ -226,7 +304,8 @@ def parse_response(text, fields, questions, mode, *, require_evidence=False):
     return [by_id[fid] for fid in fields]
 
 
-def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require_evidence=False, source_text=None):
+def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require_evidence=False, source_text=None,
+                   system_prompt=SYSTEM_PROMPT, row_validator=None):
     if require_evidence and source_text is None:
         raise ValueError("Quote validation requires the supplied source text")
     attempts = []
@@ -234,7 +313,7 @@ def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require
         raw = ""
         diagnostics = {}
         try:
-            raw = infer([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}], mode)
+            raw = infer([{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], mode)
             diagnostics = dict(getattr(infer, "last_diagnostics", {}))
             rows = parse_response(raw, fields, questions, mode, require_evidence=require_evidence)
             if require_evidence and source_text is not None:
@@ -261,6 +340,8 @@ def request_bundle(infer, prompt, fields, questions, mode, retries=1, *, require
                             row["answers"] = "N/A"
                         elif target == "max_temp":
                             row["answers"] = format(normalize_value(target, row["answers"])[0], "g")
+            if row_validator is not None:
+                rows = row_validator(rows)
             for row in rows:
                 row["extraction_status"] = ("not_mentioned" if normalize_value(
                     questions[row["field_id"]]["target_column"], row["answers"])[1] == "not_mentioned" else "extracted")
@@ -294,6 +375,7 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
     rows, error = [], "No matching notes for this bundle" if not notes else ""
     if notes and strategy == "per_note":
         findings = []
+        evidence_by_note = {}
         for note_index, note, relevant in note_jobs(encounter, fields, questions):
             prompt = build_prompt(encounter, relevant, questions, mode, note_text=render_note(note), note_date=note["date"])
             key = hashlib.sha256((cache_scope + "\n" + mode + "\n" + SYSTEM_PROMPT + "\n" + prompt).encode()).hexdigest()
@@ -304,11 +386,12 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
                 note_rows, error, log = request_bundle(infer, prompt, relevant, questions, mode, retries,
                     require_evidence=True, source_text=note["text"])
                 if not error:
-                    # Cache standard response fields. No model-inferred answers or
-                    # rationales are inserted into the final clinical-note content.
+                    # Preserve decisions/rationales for integration. Quotes remain
+                    # local provenance and are not sent to the final model.
                     note_rows = [{"field_id": r["field_id"], "answers": r["answers"],
                                   "evidence_from_text": r["evidence_from_text"],
-                                  "extraction_status": r["extraction_status"]}
+                                  "extraction_status": r["extraction_status"],
+                                  "reasoning_trace": r.get("reasoning_trace", "")}
                                  for r in note_rows]
                     if evidence_cache is not None:
                         evidence_cache[key] = dict(record_id=encounter["record_id"], model=cache_scope, mode=mode,
@@ -319,13 +402,14 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
             attempts.extend(dict(stage="note", note_index=note_index, source=note["source"], **a) for a in log)
             if error:
                 break
-            excerpts = collect_excerpts(note, note_rows, [questions[fid]["target_column"] for fid in relevant])
-            findings.append(dict(note={k: v for k, v in note.items() if k != "text"}, excerpts=excerpts))
+            finding = integration_finding(note, note_index, note_rows)
+            findings.append(finding)
+            evidence_by_note[finding["note_id"]] = {r["field_id"]: r for r in note_rows}
         if not error:
-            evidence_text = render_evidence_notes(findings)
-            prompt = build_prompt(encounter, fields, questions, mode, note_text=evidence_text)
+            prompt = build_integration_prompt(encounter, fields, questions, mode, findings)
             rows, error, log = request_bundle(infer, prompt, fields, questions, mode, retries,
-                require_evidence=True, source_text=evidence_text)
+                system_prompt=INTEGRATION_SYSTEM_PROMPT,
+                row_validator=lambda accepted: integrated_rows(accepted, findings, evidence_by_note))
             attempts.extend(dict(stage="final", **a) for a in log)
     elif notes:
         prompt = build_prompt(encounter, fields, questions, mode)
@@ -346,6 +430,9 @@ def extract_bundle(infer, encounter, fields, questions, mode, strategy, *, retri
                           missing_note_sources=[s for s in q["note_sources"] if not any(n["source"] == s for n in notes)])
         for extra in mode_settings(mode)["extra_fields"]:
             prediction[extra] = raw.get(extra, "")
+        if strategy == "per_note":
+            prediction.update(final_pass_contract=FINAL_PASS_CONTRACT,
+                              supporting_note_ids=raw.get("supporting_note_ids", []))
         result.append(prediction)
     return result, attempts
 
@@ -489,7 +576,8 @@ def main():
     fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     manifest = dict(fingerprint=fingerprint, **signature, record_ids=[e["record_id"] for e in encounters],
                     variants=variants, bundles=batches, dry_run=args.dry_run,
-                    prompt_contract="research_question_instructions_v3")
+                    prompt_contract="research_question_instructions_v3",
+                    final_pass_contract=FINAL_PASS_CONTRACT if args.note_strategy == "per_note" else "full_note_extraction")
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     manifest_path, pred_path = output / "run_manifest.json", output / "research_predictions.json"

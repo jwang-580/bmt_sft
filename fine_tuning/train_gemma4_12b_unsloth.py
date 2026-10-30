@@ -24,12 +24,15 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from prompt_eval.extraction_prompts import SFT_OUTPUT_FIELDS
 DEFAULT_TRAIN_FILE = REPO_ROOT / "fine_tuning" / "outputs" / "mimic_sft_fpc5_train.jsonl"
 DEFAULT_EVAL_IDS = REPO_ROOT / "fine_tuning" / "mimic_eval_record_ids.json"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "fine_tuning" / "outputs" / "gemma4_12b_lora"
 DEFAULT_MODEL = "google/gemma-4-12B-it"
 DEFAULT_MIMIC_FILE = REPO_ROOT / "data" / "mimic_iv_bmt_initial_progression.csv"
-DEFAULT_QUESTIONS_FILE = REPO_ROOT / "data" / "CIBMTR_Form_2400_R11_Items_simplified.csv"
+DEFAULT_QUESTIONS_FILE = REPO_ROOT / "resources" / "CIBMTR_Form_2400_R11_Items_simplified.csv"
 DEFAULT_GOLD_FILE = REPO_ROOT / "data" / "mimic_form_2400_answers.json"
 
 
@@ -66,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--wandb_project", default="bmt-sft")
     parser.add_argument("--wandb_run_name", default="gemma4-12b-lora-r16")
+    parser.add_argument("--report_to", choices=("none", "wandb"), default="none",
+                        help="Training telemetry is local by default; explicitly opt into W&B.")
     parser.add_argument("--resume_from_checkpoint", nargs="?", const=True, default=None)
     parser.add_argument(
         "--skip_eval",
@@ -130,6 +135,15 @@ def validate_inputs(train_file: Path, eval_ids_path: Path) -> dict[str, Any]:
                 raise ValueError(
                     f"Assistant content must be a non-empty JSON list with record_id at {train_file}:{line_number}"
                 ) from exc
+            if not 1 <= len(assistant_rows) <= 5 or any(not isinstance(item, dict) for item in assistant_rows):
+                raise ValueError(f"Expected one to five field objects at training line {line_number}")
+            if any(set(item) != set(SFT_OUTPUT_FIELDS) for item in assistant_rows):
+                raise ValueError(f"Unexpected assistant field schema at training line {line_number}")
+            if any(str(item["record_id"]) != record_id for item in assistant_rows):
+                raise ValueError(f"Mixed admission identities at training line {line_number}")
+            field_ids = [str(item["field_id"]) for item in assistant_rows]
+            if len(field_ids) != len(set(field_ids)):
+                raise ValueError(f"Duplicate assistant field at training line {line_number}")
             record_ids.add(record_id)
             examples += 1
             max_chars = max(max_chars, sum(len(message["content"]) for message in messages))
@@ -290,7 +304,7 @@ def run_held_out_validation(
             parse_errors += int(bool(parse_error))
             predictions.extend(batch_predictions)
         write_json(checkpoint_path, predictions)
-        print(f"Validated held-out record {note_index}/{len(notes)}: {note['record_id']}")
+        print(f"Validated held-out record {note_index}/{len(notes)}")
 
     metrics = evaluation.evaluate_predictions(predictions, gold)
     metrics.update(
@@ -346,7 +360,7 @@ def main() -> int:
         "max_steps": args.max_steps,
         "effective_batch_size": args.per_device_train_batch_size * args.gradient_accumulation_steps,
         "optimizer": "adamw_torch_fused",
-        "report_to": "wandb",
+        "report_to": args.report_to,
         "wandb_project": args.wandb_project,
         "wandb_run_name": args.wandb_run_name,
         "trainer_eval_dataset": None,
@@ -433,7 +447,7 @@ def main() -> int:
             seed=args.seed,
             bf16=is_bfloat16_supported(),
             fp16=not is_bfloat16_supported(),
-            report_to="wandb",
+            report_to=args.report_to,
             run_name=args.wandb_run_name,
             save_strategy="steps",
             save_steps=args.save_steps,

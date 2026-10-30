@@ -62,6 +62,19 @@ from datetime import datetime
 from pathlib import Path
 
 try:
+    from .registry_contract import (
+        coerce_records as _coerce_registry_records,
+        parse_non_json_generation as _parse_registry_text,
+        prediction_is_usable, require_complete_predictions, validate_resume_predictions,
+    )
+except ImportError:
+    from registry_contract import (
+        coerce_records as _coerce_registry_records,
+        parse_non_json_generation as _parse_registry_text,
+        prediction_is_usable, require_complete_predictions, validate_resume_predictions,
+    )
+
+try:
     from .extraction_prompts import (
         DEFAULT_MODES,
         JSON_MODE_FIELDS,
@@ -637,46 +650,11 @@ def salvage_json_records(text):
 
 
 def parse_non_json_generation(text, field_ids):
-    by_field = {}
-    for line in text.splitlines():
-        match = re.match(r"\s*(?:(?:Question|Field)\s*)?([A-Za-z]*\d+[A-Za-z]*)\s*[:=-]\s*(.+?)\s*$", line)
-        if match:
-            by_field[normalize_question_number(match.group(1))] = match.group(2)
-    return [{"field_id": field_id, "answers": by_field.get(field_id, "N/A")} for field_id in field_ids]
+    return _parse_registry_text(text, field_ids)
 
 
 def coerce_records(raw_records, note, field_ids, question_metadata, mode):
-    settings = mode_settings(mode)
-    by_field = {}
-    field_name_lookup = build_field_name_lookup(field_ids, question_metadata)
-    for index, record in enumerate(raw_records):
-        if isinstance(record, dict):
-            field_id = resolve_record_field_id(record, field_ids, field_name_lookup)
-            if not field_id and index < len(field_ids):
-                field_id = field_ids[index]
-            if field_id:
-                by_field[field_id] = record
-
-    coerced = []
-    for field_id in field_ids:
-        metadata = question_metadata[field_id]
-        raw = by_field.get(field_id, {})
-        record = {
-            "record_id": note["record_id"],
-            "record_id_type": note["record_id_type"],
-            "date": note["date"],
-            "field_id": field_id,
-            "field_category": raw.get("field_category") or metadata["field_category"],
-            "field_name": raw.get("field_name") or metadata["field_name"],
-            "field_instructions": raw.get("field_instructions") or metadata["field_instructions"],
-            "answers": raw.get("answers", "N/A"),
-        }
-        if "evidence_from_text" in settings["extra_fields"]:
-            record["evidence_from_text"] = raw.get("evidence_from_text", "")
-        if "reasoning_trace" in settings["extra_fields"]:
-            record["reasoning_trace"] = raw.get("reasoning_trace", "")
-        coerced.append(record)
-    return coerced
+    return _coerce_registry_records(raw_records, note, field_ids, question_metadata, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +932,7 @@ def generate_predictions(
             else:
                 raw_records = parse_non_json_generation(generated, field_batch)
             predictions = coerce_records(raw_records, note, field_batch, question_metadata, mode)
+            require_complete_predictions(predictions)
             attempts.append(
                 {"attempt": attempt, "reasoning": reasoning, "raw_generation": generated, "parse_error": ""}
             )
@@ -965,7 +944,7 @@ def generate_predictions(
             )
 
     predictions = coerce_records(
-        [{"field_id": field_id, "answers": "N/A"} for field_id in field_batch],
+        [],
         note,
         field_batch,
         question_metadata,
@@ -1003,6 +982,8 @@ def evaluate_predictions(predictions, gold):
         if key not in gold:
             continue
         covered += 1
+        if not prediction_is_usable(pred):
+            continue
         gold_answer = gold[key]
         pred_answer = pred.get("answers", "N/A")
         exact_match = answers_match(key[1], pred_answer, gold_answer)
@@ -1033,6 +1014,7 @@ def existing_completed(path):
             if not line.strip():
                 continue
             record = json.loads(line)
+            validate_resume_predictions(record.get("predictions", []))
             for pred in record.get("predictions", []):
                 done.add(
                     (
@@ -1103,7 +1085,7 @@ def main():
     parser.add_argument("--dataset", choices=["mimic", "osu"], default="mimic")
     parser.add_argument("--mimic_path", default="data/mimic_iv_bmt_initial_progression.csv")
     parser.add_argument("--osu_path", default="data/osu_h_p_notes.csv")
-    parser.add_argument("--questions", default="data/CIBMTR_Form_2400_R11_Items_simplified.csv")
+    parser.add_argument("--questions", default="resources/CIBMTR_Form_2400_R11_Items_simplified.csv")
     parser.add_argument(
         "--gold_json",
         default=None,
@@ -1327,6 +1309,7 @@ def main():
 
     summary_rows = []
     all_predictions = load_json_list(checkpoint_paths["predictions"]) if args.resume else []
+    validate_resume_predictions(all_predictions)
 
     for model_name in models:
         try:

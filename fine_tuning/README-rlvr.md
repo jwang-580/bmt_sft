@@ -7,9 +7,9 @@ training notes, but does not load the SFT adapter or its weights. The fixed
 answers remain in reward columns and are never included in model prompts. The
 20 held-out record IDs are checked before training to prevent data leakage.
 
-Use a CUDA environment with the newer RL stack in
-`fine_tuning/requirements-rlvr.txt`. The original SFT requirements remain
-separate because they pin an older TRL release.
+Use a separate CUDA environment with `fine_tuning/requirements-rlvr.txt`.
+The SFT and RLVR dependency files target different TRL versions. Recorded SFT
+run versions are listed in the [reproducibility guide](../docs/reproducibility.md).
 
 ```bash
 pip install -r fine_tuning/requirements-rlvr.txt

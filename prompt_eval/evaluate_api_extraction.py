@@ -32,7 +32,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        """Environment variables still work without the optional dotenv loader."""
+        return False
 
 try:
     from . import evaluate_gemma4_extraction as common
@@ -154,6 +159,7 @@ def generate_predictions(
                 else common.parse_non_json_generation(generated, field_batch)
             )
             predictions = common.coerce_records(records, note, field_batch, metadata, mode)
+            common.require_complete_predictions(predictions)
             attempts.append({"attempt": attempt, "raw_generation": generated, "parse_error": ""})
             return generated, predictions, "", attempts
         except (ValueError, json.JSONDecodeError) as exc:
@@ -171,7 +177,7 @@ def parse_args(argv=None):
     parser.add_argument("--dataset", choices=["mimic", "osu"], default="mimic")
     parser.add_argument("--mimic_path", default="data/mimic_iv_bmt_initial_progression.csv")
     parser.add_argument("--osu_path", default="data/osu_h_p_notes.csv")
-    parser.add_argument("--questions", default="data/CIBMTR_Form_2400_R11_Items_simplified.csv")
+    parser.add_argument("--questions", default="resources/CIBMTR_Form_2400_R11_Items_simplified.csv")
     parser.add_argument("--gold_json", default=None)
     parser.add_argument("--output_dir", default="prompt_eval/results")
     parser.add_argument("--models", default=",".join(MODELS), help="Comma-separated API model IDs.")
@@ -256,6 +262,7 @@ def main(argv=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = common.concentrated_paths(output_dir, args.dataset, models)
     all_predictions = common.load_json_list(checkpoint["predictions"]) if args.resume else []
+    common.validate_resume_predictions(all_predictions)
     completed = common.existing_completed_predictions(all_predictions) if args.resume else set()
     summary_rows = []
 

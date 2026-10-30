@@ -12,8 +12,8 @@ from unittest.mock import Mock, patch
 from research_eval import research_extract as extraction
 from research_eval.research_common import (RESEARCH_FIELDS, data_audit, gold_label, load_encounters,
     load_ground_truth, load_questions, normalize_value, progress_date, record_id,
-    unique_encounters, write_csv)
-from research_eval.research_eval import evaluate_file, load_predictions, score_variant
+    unique_encounters, write_csv, file_hash)
+from research_eval.research_eval import evaluate_file, load_predictions, score_variant, resolve_evaluation_ground_truth
 from prompt_eval.extraction_prompts import (EXTRACTION_SYSTEM_PROMPT, build_sft_user_prompt,
     build_questions_block, build_user_prompt)
 
@@ -28,7 +28,8 @@ def fixture(directory):
         row = dict(c, **{f: "" for f in RESEARCH_FIELDS})
         row.update(crs_y_n="N", hypotension_y_n="N", pressor_use_num="0", hypoxia_y_n="N",
                    high_flow_o2_y_n="N", bipap_or_intubation_y_n="N", neurotox_y_n="N",
-                   toci_y_n="N", total_dose_toci="0")
+                   toci_y_n="N", total_dose_toci="0", fever_onset_date="N/A",
+                   last_fever_date="N/A", max_temp="N/A")
         row["review_comment"] = "GT_COMMENT_SENTINEL"
         gold.append(row)
     write_csv(directory / "toci_ptcy_crs.csv", gold, list(gold[0]))
@@ -42,6 +43,20 @@ def fixture(directory):
                       note="FIRST_DISCHARGE" if i == 0 else "SECOND_DISCHARGE") for i, c in enumerate(cohort)]
     write_csv(directory / "dc_summary_notes.csv", discharge, list(discharge[0]))
     return cohort, gold
+
+
+def mock_integration(messages):
+    """Synthetic model response citing the first usable daily field finding."""
+    prompt = messages[-1]["content"]
+    findings = json.loads(prompt.split("Daily findings JSON:\n", 1)[1])
+    result = []
+    for fid in re.findall(r"^Field (R\d+)$", prompt, flags=re.M):
+        candidates = [(f["note_id"], r) for f in findings for r in f["fields"]
+                      if r["field_id"] == fid and r["extraction_status"] == "extracted"]
+        result.append(dict(field_id=fid, answers=candidates[0][1]["answers"] if candidates else "not mentioned",
+                           supporting_note_ids=[candidates[0][0]] if candidates else [],
+                           reasoning_trace="Integrated saved daily finding."))
+    return json.dumps(result)
 
 
 class ResearchTests(unittest.TestCase):
@@ -58,6 +73,48 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual([len(b) for b in batches], [5, 5, 4])
         self.assertEqual([f for b in batches for f in b], list(self.questions))
 
+    def test_label_revision_is_run_scoped_and_explicit_labels_override_it(self):
+        predictions = self.path / "predictions.json"
+        original = self.path / "toci_ptcy_crs.csv"
+        revised = self.path / "adjudicated.csv"
+        self.assertEqual(resolve_evaluation_ground_truth(predictions).name, "toci_ptcy_crs.csv")
+        manifest = self.path / "run_manifest.json"
+        manifest.write_text(json.dumps({"evaluation_ground_truth": str(revised)}))
+        self.assertEqual(resolve_evaluation_ground_truth(predictions), revised)
+        self.assertEqual(resolve_evaluation_ground_truth(predictions, original), original)
+
+    def test_unverified_label_is_excluded_without_becoming_a_negative(self):
+        gold = dict(self.gold[0], crs_y_n="", neurotox_y_n="", max_temp="")
+        cohort = unique_encounters(self.cohort[:1], "fixture")
+        labels = unique_encounters([gold], "fixture")
+        rid = record_id(next(iter(cohort)))
+        predictions = [dict(record_id=rid, field_id=fid, answers="not mentioned") for fid in self.questions]
+        summary, metrics, details = score_variant(predictions, labels, cohort, self.questions)
+        for field in ("crs_y_n", "neurotox_y_n", "max_temp"):
+            row = next(d for d in details if d["target_column"] == field)
+            self.assertEqual(row["gold_status"], "unlabeled")
+            self.assertFalse(row["scorable"])
+        self.assertEqual(summary["scorable_answers"], 11)
+
+    def test_revised_label_provenance_does_not_apply_to_explicit_original_labels(self):
+        rid = record_id(next(iter(unique_encounters(self.cohort[:1], "fixture"))))
+        variant = dict(model="m", mode="baseline", note_strategy="full", fields_per_call=5)
+        predictions = self.path / "predictions.json"
+        predictions.write_text(json.dumps([dict(variant, record_id=rid, field_id="R01", answers="Y")]))
+        revised = self.path / "adjudicated.csv"
+        rows = [dict(r) for r in self.gold]
+        rows[0]["crs_y_n"] = "Y"
+        write_csv(revised, rows, list(rows[0]))
+        (self.path / "run_manifest.json").write_text(json.dumps(dict(
+            record_ids=[rid], variants=[variant], evaluation_ground_truth=str(revised),
+            evaluation_label_revision="test_revision", evaluation_type="extraction-informed label adjudication")))
+        revised_summary = evaluate_file(predictions, revised, self.path / "target_filtered.csv", self.path / "revised_scores")[0]
+        original_summary = evaluate_file(predictions, self.path / "toci_ptcy_crs.csv", self.path / "target_filtered.csv", self.path / "original_scores")[0]
+        self.assertEqual(revised_summary["label_revision"], "test_revision")
+        self.assertEqual(original_summary["evaluation_type"], "explicit_alternative_labels")
+        self.assertNotIn("label_revision", original_summary)
+        self.assertGreater(revised_summary["exact_accuracy"], original_summary["exact_accuracy"])
+
     def test_gt_selection_and_duplicate_encounter_rejection(self):
         self.assertEqual(len(load_ground_truth(self.path / "toci_ptcy_crs.csv")), 2)
         with self.assertRaises(ValueError):
@@ -68,6 +125,20 @@ class ResearchTests(unittest.TestCase):
         write_csv(self.path / "blank.csv", rows, list(rows[0]))
         with self.assertRaisesRegex(ValueError, "All research labels are blank"):
             load_ground_truth(self.path / "blank.csv")
+
+    def test_canonical_labels_carry_revision_without_run_manifest(self):
+        predictions = self.path / "predictions.json"
+        predictions.write_text("[]")
+        labels = self.path / "toci_ptcy_crs.csv"
+        sidecar = labels.with_suffix(".manifest.json")
+        sidecar.write_text(json.dumps(dict(revised_sha256=file_hash(labels),
+            revision="corrected_v1", evaluation_type="extraction-informed label adjudication")))
+        summary = evaluate_file(predictions, labels, self.path / "target_filtered.csv", self.path / "scores")[0]
+        self.assertEqual(summary["label_revision"], "corrected_v1")
+        self.assertEqual(summary["evaluation_type"], "extraction-informed label adjudication")
+        sidecar.write_text(json.dumps(dict(revised_sha256="incorrect")))
+        with self.assertRaisesRegex(ValueError, "Label CSV does not match"):
+            evaluate_file(predictions, labels, self.path / "target_filtered.csv", self.path / "scores")
 
     def test_source_routing_no_gt_leakage_or_cross_admission_fallback(self):
         first = extraction.build_prompt(self.encounters[0], ["R10"], self.questions, "baseline")
@@ -102,7 +173,7 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(normalize_value("total_dose_toci", "2.0"), (2, "valid"))
         self.assertEqual(normalize_value("total_dose_toci", "2.5")[1], "invalid")
         self.assertEqual(normalize_value("bipap_or_intubation_y_n", "B")[1], "invalid")
-        self.assertEqual(gold_label("max_temp", {"crs_y_n": "N"}), (None, "not_applicable"))
+        self.assertEqual(gold_label("max_temp", {"crs_y_n": "N"}), (None, "unlabeled"))
         self.assertEqual(gold_label("max_temp", {"crs_y_n": "Y"}), (None, "unlabeled"))
         self.assertEqual(gold_label("neurotox_y_n", {}), (None, "unlabeled"))
 
@@ -166,27 +237,78 @@ class ResearchTests(unittest.TestCase):
                           self.path / "target_filtered.csv", self.path / "scores",
                           manifest_path=self.path / "absent.json")
 
-    def test_final_prompt_preserves_verbatim_evidence_without_model_answers(self):
+    def test_final_integrates_json_findings_without_raw_notes_or_quotes(self):
         prompts = []
         for note in self.encounters[0]["notes"]:
             note["text"] = note["text"].rstrip(".") + ". Tocilizumab given once."
         def fake(messages, mode):
             prompt = messages[-1]["content"]
             prompts.append(prompt)
+            if messages[0]["content"] == extraction.INTEGRATION_SYSTEM_PROMPT:
+                return mock_integration(messages)
             return json.dumps([dict(field_id="R14", answers="1", evidence_from_text="Tocilizumab given once",
                                     reasoning_trace="MODEL_RATIONALE_SENTINEL")])
         rows, log = extraction.extract_bundle(fake, self.encounters[0], ["R14"], self.questions,
                                               "baseline", "per_note", retries=0)
         self.assertTrue(rows[0]["extraction_success"])
         self.assertEqual(rows[0]["answers"], "1")
-        self.assertIn("Tocilizumab given once", prompts[-1])
-        self.assertIn("Source: discharge", prompts[-1])
-        self.assertIn("FIRST_ADMISSION_PROGRESS", prompts[-1])  # Neighboring source context.
-        self.assertIn("FIRST_DISCHARGE", prompts[-1])
+        self.assertNotIn("Tocilizumab given once", prompts[-1])
+        self.assertIn('"source": "discharge"', prompts[-1])
+        self.assertNotIn("FIRST_ADMISSION_PROGRESS", prompts[-1])
+        self.assertNotIn("FIRST_DISCHARGE", prompts[-1])
         self.assertEqual(len(prompts), 3)  # One progress note, one discharge, one synthesis.
-        self.assertNotIn('"answers":', prompts[-1])
-        self.assertNotIn("MODEL_RATIONALE_SENTINEL", prompts[-1])
+        self.assertIn('"answers": "1"', prompts[-1])
+        self.assertIn("MODEL_RATIONALE_SENTINEL", prompts[-1])
+        self.assertNotIn('"evidence_from_text":', prompts[-1])
+        self.assertEqual(rows[0]["evidence_from_text"], "Tocilizumab given once")
+        self.assertEqual(rows[0]["supporting_note_ids"], ["note_0000"])
         self.assertEqual(log[-1]["stage"], "final")
+
+    def test_integration_transports_daily_attribution_and_deduplicates_provenance(self):
+        encounter = dict(self.encounters[0], notes=[
+            dict(source="progress", date="2020-01-11", expected_date="2020-01-12", date_conflict=True,
+                 slot="2", text="SOURCE_SENTINEL. Toci given once."),
+            dict(source="discharge", date="2020-02-01", admit_date="2020-01-01",
+                 text="DISCHARGE_SENTINEL. Toci given once.")])
+        cache = {}
+        final_seen = []
+        def infer(messages, mode):
+            if messages[0]["content"] == extraction.INTEGRATION_SYSTEM_PROMPT:
+                findings = json.loads(messages[-1]["content"].split("Daily findings JSON:\n",1)[1])
+                final_seen.extend(findings)
+                # Synthetic integration response cites two mentions of the same dose.
+                return json.dumps([dict(field_id="R14", answers="1",
+                    supporting_note_ids=[f["note_id"] for f in findings], reasoning_trace="Same dose repeated in discharge.")])
+            return json.dumps([dict(field_id="R14", answers="1", evidence_from_text="Toci given once.",
+                reasoning_trace="One CRS-directed administration; the discharge repeats the event.")])
+        with patch.object(extraction,"collect_excerpts", side_effect=AssertionError("Excerpt selection must not run")):
+            rows, log = extraction.extract_bundle(infer, encounter, ["R14"], self.questions,
+                "baseline", "per_note", retries=0, evidence_cache=cache)
+        self.assertTrue(rows[0]["extraction_success"])
+        self.assertEqual(rows[0]["answers"], "1")
+        self.assertEqual(rows[0]["evidence_from_text"], "Toci given once.")
+        self.assertEqual(len(rows[0]["supporting_note_ids"]), 2)
+        self.assertTrue(final_seen[0]["date_conflict"])
+        self.assertEqual(final_seen[0]["slot_derived_date"], "2020-01-12")
+        self.assertIn("CRS-directed", final_seen[0]["fields"][0]["reasoning_trace"])
+        self.assertTrue(all(v["fields"][0]["reasoning_trace"] for v in cache.values()))
+        self.assertEqual(len(log), 3)
+
+    def test_integration_rejects_invalid_contributing_notes_and_retries(self):
+        findings = [dict(note_id="note_0000",fields=[dict(field_id="R11",answers="Y",extraction_status="extracted")]),
+                    dict(note_id="note_0001",fields=[dict(field_id="R11",answers="not mentioned",extraction_status="not_mentioned")])]
+        evidence = {"note_0000":{"R11":dict(evidence_from_text="Toci administered.")},"note_0001":{"R11":dict(evidence_from_text="")}}
+        for refs in (["unknown"],["note_0001"],["note_0000","note_0000"],[],None):
+            with self.subTest(refs=refs),self.assertRaises(ValueError):
+                extraction.integrated_rows([dict(field_id="R11",answers="Y",supporting_note_ids=refs)],findings,evidence)
+        calls=iter([json.dumps([dict(field_id="R11",answers="Y",supporting_note_ids=["unknown"])]),
+                    json.dumps([dict(field_id="R11",answers="Y",supporting_note_ids=["note_0000"])])])
+        rows,error,attempts=extraction.request_bundle(lambda *_:next(calls),"integration",["R11"],self.questions,"baseline",
+            system_prompt=extraction.INTEGRATION_SYSTEM_PROMPT,
+            row_validator=lambda rows:extraction.integrated_rows(rows,findings,evidence))
+        self.assertFalse(error)
+        self.assertEqual(len(attempts),2)
+        self.assertEqual(rows[0]["evidence_from_text"],"Toci administered.")
 
     def test_missing_and_failed_predictions_penalized_no_temp_wildcard(self):
         cohort = unique_encounters(self.cohort, "test")
@@ -254,6 +376,8 @@ class ResearchTests(unittest.TestCase):
         def fake(messages, mode):
             prompt = messages[-1]["content"]
             prompts.append(prompt)
+            if messages[0]["content"] == extraction.INTEGRATION_SYSTEM_PROMPT:
+                return mock_integration(messages)
             ids = re.findall(r"^Field (R\d+)$", prompt, flags=re.M)
             return json.dumps([dict(field_id=f, answers="N/A", evidence_from_text="", reasoning_trace="") for f in ids])
         rows, log = extraction.extract_bundle(fake, self.encounters[0], fields, self.questions,
@@ -366,6 +490,8 @@ class ResearchTests(unittest.TestCase):
             prompt = messages[-1]["content"]
             fields = re.findall(r"^Field (R\d+)$", prompt, flags=re.M)
             calls.append(fields)
+            if messages[0]["content"] == extraction.INTEGRATION_SYSTEM_PROMPT:
+                return mock_integration(messages)
             return json.dumps([dict(field_id=f, answers="N/A", evidence_from_text="", reasoning_trace="") for f in fields])
         argv = ["research_extract.py", "--data_dir", str(self.path), "--output_dir", str(output), "--limit", "1"]
         with patch("sys.argv", argv), patch.object(extraction, "make_infer", return_value=(fake, lambda: None)), contextlib.redirect_stdout(io.StringIO()):
@@ -376,6 +502,7 @@ class ResearchTests(unittest.TestCase):
         manifest = json.loads((output / "run_manifest.json").read_text())
         self.assertEqual(manifest["variants"][0]["note_strategy"], "per_note")
         self.assertEqual(manifest["prompt_contract"], "research_question_instructions_v3")
+        self.assertEqual(manifest["final_pass_contract"], extraction.FINAL_PASS_CONTRACT)
         self.assertTrue(all("events" not in field for v in saved.values() for field in v["fields"]))
         with patch("sys.argv", argv+["--resume"]), patch.object(extraction, "make_infer") as loader, contextlib.redirect_stdout(io.StringIO()):
             extraction.main()
@@ -569,7 +696,7 @@ class ResearchTests(unittest.TestCase):
         loader.assert_not_called()
 
 
-    def test_not_mentioned_is_an_abstention_not_a_negative_or_not_applicable_match(self):
+    def test_not_mentioned_scores_as_no_without_rewriting_raw_status(self):
         self.assertEqual(normalize_value("crs_y_n", "not mentioned"), (None, "not_mentioned"))
         gt = dict(self.gold[0])
         key = ("001", "2020-01-10")
@@ -577,9 +704,72 @@ class ResearchTests(unittest.TestCase):
                       extraction_success=True) for fid in ("R01", "R02")]
         summary, metrics, details = score_variant(preds, {key: gt}, {key: gt}, self.questions)
         self.assertEqual(summary["not_mentioned_predictions"], 2)
-        self.assertEqual(summary["exact_accuracy"], 0)
+        self.assertEqual(summary["exact_accuracy"], 2/14)
+        self.assertEqual(summary["not_mentioned_as_no_correct"], 2)
+        self.assertEqual(summary["valid_prediction_coverage"], 0)
+        self.assertEqual(summary["scoring_prediction_coverage"], 2/14)
         selected = [d for d in details if d["field_id"] in {"R01", "R02"}]
-        self.assertTrue(all(d["prediction_status"] == "not_mentioned" and not d["exact"] for d in selected))
+        self.assertTrue(all(d["prediction_status"] == "not_mentioned" and d["exact"] for d in selected))
+        self.assertEqual(selected[0]["normalized_prediction"], "N")
+        self.assertIsNone(selected[1]["normalized_prediction"])
+
+    def test_blank_fever_gold_is_unknown_regardless_of_crs(self):
+        for field in ("fever_onset_date", "last_fever_date", "max_temp"):
+            for crs in ("Y", "N"):
+                for raw in ("", "unknown", None):
+                    self.assertEqual(gold_label(field, {"crs_y_n": crs, field: raw}), (None, "unlabeled"))
+                self.assertEqual(gold_label(field, {"crs_y_n": crs, field: "N/A"}), (None, "not_applicable"))
+        self.assertEqual(gold_label("toci_start_date", {"toci_y_n": "N"}), (None, "not_applicable"))
+        key = ("001", "2020-01-10")
+        gt = dict(self.gold[0], fever_onset_date="", last_fever_date="", max_temp="")
+        preds = [dict(record_id=record_id(key), field_id="R02", answers="2020-01-12")]
+        summary, _, details = score_variant(preds, {key: gt}, {key: gt}, self.questions)
+        self.assertEqual(summary["excluded_gt_answers"], 3)
+        self.assertFalse(next(d for d in details if d["field_id"] == "R02")["scorable"])
+
+    def test_not_mentioned_matches_negative_values_but_never_positive_targets(self):
+        key = ("001", "2020-01-10")
+        gt = dict(self.gold[0], crs_y_n="Y", pressor_use_num="2", max_temp="102")
+        preds = [dict(record_id=record_id(key), field_id=fid, answers="not mentioned")
+                 for fid in ("R01", "R04", "R06", "R07", "R12", "R14")]
+        _, metrics, details = score_variant(preds, {key: gt}, {key: gt}, self.questions)
+        by_id = {d["field_id"]:d for d in details}
+        self.assertTrue(all(not by_id[fid]["exact"] for fid in ("R01", "R04", "R06")))
+        self.assertTrue(all(by_id[fid]["exact"] for fid in ("R07", "R12", "R14")))
+        self.assertEqual(by_id["R06"]["normalized_prediction"], 0)
+        binary = {m["field_id"]:m for m in metrics}
+        self.assertEqual(binary["R07"]["tn"], 1)
+        self.assertEqual(binary["R01"]["fn"], 1)
+
+    def test_aggregation_audit_reconstructs_cache_and_detects_lost_indication_context(self):
+        from research_eval.analyze_aggregation_losses import analyze
+        fields = ["R11", "R12", "R13", "R14"]
+        for note in self.encounters[0]["notes"]:
+            note["text"] = "CRS diagnosed. Severe symptoms. Infection ruled out. Toci given once. Symptoms improved."
+        cache = {}
+        def infer(messages, mode):
+            if messages[0]["content"] == extraction.INTEGRATION_SYSTEM_PROMPT:
+                return mock_integration(messages)
+            return json.dumps([dict(field_id=f, answers="not mentioned", evidence_from_text="")
+                               if f != "R11" else dict(field_id=f, answers="Y", evidence_from_text="Toci given once.")
+                               for f in fields])
+        predictions, _ = extraction.extract_bundle(infer, self.encounters[0], fields, self.questions,
+            "baseline", "per_note", retries=0, evidence_cache=cache, cache_scope="fake")
+        for p in predictions:
+            p.update(model="fake", mode="baseline", bundle_index=3)
+            p.pop("final_pass_contract", None)  # Fixture represents a historical excerpt-based run.
+        predictions[0].update(answers="not mentioned", extraction_status="not_mentioned")
+        with patch("research_eval.analyze_aggregation_losses.load_encounters", return_value=self.encounters):
+            run = self.path / "audit_run"
+            run.mkdir()
+            (run / "research_predictions.json").write_text(json.dumps(predictions))
+            (run / "note_evidence.json").write_text(json.dumps(cache))
+            (run / "run_manifest.json").write_text("{}")
+            summary = analyze(run, self.path / "aggregation_audit", self.path)
+        self.assertEqual(summary["losses"], 1)
+        self.assertTrue(summary["all_quotes_retained"])
+        self.assertEqual(summary["tocilizumab_crs_context_dropped_cases"], 1)
+        self.assertEqual(summary["outcomes"], {"final_negative_correct":1})
 
     def test_question_instructions_specify_support_and_missing_information(self):
         for fid, q in self.questions.items():
@@ -621,7 +811,7 @@ class ResearchTests(unittest.TestCase):
             self.assertEqual(normalize_value("max_temp", value)[1], "invalid")
         self.assertEqual(normalize_value("total_dose_toci", "1F")[1], "invalid")
 
-    def test_candidate_context_survives_note_abstentions_without_extra_calls(self):
+    def test_final_receives_abstentions_as_json_without_raw_candidate_passages(self):
         encounter = dict(self.encounters[0], notes=[
             dict(source="discharge", date="2020-02-01", admit_date="2020-01-01",
                  text="On January 12. Tmax 100.4 F. The next day. Tmax 100.6 F. No fever today."),
@@ -629,15 +819,17 @@ class ResearchTests(unittest.TestCase):
         prompts = []
         def infer(messages, mode):
             prompts.append(messages[-1]["content"])
+            if messages[0]["content"] == extraction.INTEGRATION_SYSTEM_PROMPT:
+                return mock_integration(messages)
             return json.dumps([dict(field_id="R04", answers="not mentioned", evidence_from_text="",
                                     reasoning_trace="MODEL_RATIONALE_SENTINEL")])
         rows, _ = extraction.extract_bundle(infer, encounter, ["R04"], self.questions,
                                            "baseline", "per_note", retries=0)
         self.assertEqual(len(prompts), 2)
         for text in ["On January 12.", "Tmax 100.4 F.", "Tmax 100.6 F.", "No fever today."]:
-            self.assertIn(text, prompts[-1])
+            self.assertNotIn(text, prompts[-1])
         self.assertNotIn("HISTORY_SENTINEL", prompts[-1])
-        self.assertNotIn("MODEL_RATIONALE_SENTINEL", prompts[-1])
+        self.assertIn("MODEL_RATIONALE_SENTINEL", prompts[-1])
         self.assertEqual(rows[0]["answers"], "not mentioned")  # Retrieval does not assign an answer.
         self.assertTrue(rows[0]["extraction_success"])
 
@@ -787,6 +979,10 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(by_id["R07"]["prediction_status"], "not_mentioned")
         self.assertEqual(by_id["R08"]["prediction_status"], "failed")
         self.assertEqual(by_id["R09"]["prediction_status"], "failed")
+        self.assertTrue(by_id["R07"]["exact"])
+        self.assertFalse(by_id["R08"]["exact"])
+        self.assertFalse(by_id["R09"]["exact"])
+        self.assertEqual(by_id["R09"]["scoring_status"], "failed")
 
     def test_resume_skips_not_mentioned_and_retries_real_failures(self):
         output = self.path / "statuses"
